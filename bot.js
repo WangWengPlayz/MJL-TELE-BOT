@@ -6,12 +6,37 @@ const FILE_BASE = (token) => `https://api.telegram.org/file/bot${token}`;
 const POLL_TIMEOUT = 30;
 const MAX_BACKOFF = 30000;
 const COMMANDS_DIR = path.join(__dirname, 'commands');
+const CONFIG_FILE = path.join(__dirname, 'config.json');
 
 let offset = 0;
 let running = true;
 let backoff = 1000;
 const commands = new Map();
 let commandsLoaded = false;
+let config = null;
+
+// ---- Load config ----
+function loadConfig() {
+  try {
+    if (fs.existsSync(CONFIG_FILE)) {
+      const raw = fs.readFileSync(CONFIG_FILE, 'utf8');
+      config = JSON.parse(raw);
+      console.log('[config] Loaded successfully');
+      return config;
+    }
+  } catch (err) {
+    console.warn('[config] Error loading config.json:', err.message);
+  }
+  // Fallback to defaults
+  config = {
+    prefix: '/',
+    adminId: null,
+    adminName: 'Admin',
+    logAdminNotifications: true,
+    botName: 'Bot'
+  };
+  return config;
+}
 
 // ---- Command loader ----
 function loadCommands() {
@@ -297,21 +322,23 @@ function getUserProfilePhotos(token, userId, extra = {}) {
 async function handleMessage(token, msg) {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
-  if (!text.startsWith('/')) return;
+  const prefix = config.prefix || '/';
+  
+  if (!text.startsWith(prefix)) return;
 
   const ctx = buildCtx(token, chatId);
   ctx.raw = msg;
 
-  // User typed bare "/" — acknowledge the prefix
-  if (text === '/') {
+  // User typed bare prefix — acknowledge it
+  if (text === prefix) {
     return ctx.reply(
-      '👋 Yes! <b>/</b> is my command prefix.\n\nUse /help to see all available commands.',
+      `👋 Yes! <b>${prefix}</b> is my command prefix.\n\nUse ${prefix}help to see all available commands.`,
       { parse_mode: 'HTML' }
     ).catch(() => {});
   }
 
   const [rawCmd, ...args] = text.split(/\s+/);
-  const cmdName = rawCmd.slice(1).split('@')[0].toLowerCase();
+  const cmdName = rawCmd.slice(prefix.length).split('@')[0].toLowerCase();
 
   console.log(`[${new Date().toISOString()}] [msg][${chatId}] ${text}`);
 
@@ -319,10 +346,10 @@ async function handleMessage(token, msg) {
 
   const handler = commands.get(cmdName);
 
-  // Unknown command — suggest /help
+  // Unknown command — suggest help
   if (!handler) {
     return ctx.reply(
-      `❓ Unknown command: <code>/${cmdName}</code>\n\nUse /help to see all available commands.`,
+      `❓ Unknown command: <code>${prefix}${cmdName}</code>\n\nUse ${prefix}help to see all available commands.`,
       { parse_mode: 'HTML' }
     ).catch(() => {});
   }
@@ -475,6 +502,7 @@ function ensureCommandsLoaded() {
 
 async function startBot(token) {
   setupShutdown();
+  loadConfig();
   ensureCommandsLoaded();
 
   // Clear any registered webhook before polling.
@@ -487,12 +515,32 @@ async function startBot(token) {
   }
 
   console.log(`[bot] Polling started with ${commands.size} command(s) loaded.`);
+  console.log(`[bot] Using prefix: "${config.prefix}"`);
+
+  // Notify admin that bot is online
+  if (config.adminId && config.logAdminNotifications) {
+    const timestamp = new Date().toISOString();
+    const adminMsg = `🟢 <b>${config.botName}</b> is online!\n\n` +
+      `⏰ <code>${timestamp}</code>\n` +
+      `📋 Commands loaded: <b>${commands.size}</b>\n` +
+      `🔧 Prefix: <code>${config.prefix}</code>\n` +
+      `🌐 Mode: <b>polling</b>`;
+    
+    try {
+      await sendMessage(token, config.adminId, adminMsg, { parse_mode: 'HTML' });
+      console.log(`[bot] Admin notification sent to ${config.adminId}`);
+    } catch (err) {
+      console.warn(`[bot] Could not notify admin (${config.adminId}):`, err.message);
+    }
+  }
+
   poll(token);
 }
 
 // Single-update handler for serverless/webhook environments.
 async function handleUpdate(token, update) {
   ensureCommandsLoaded();
+  if (!config) loadConfig();
   if (update.message) await handleMessage(token, update.message);
   else if (update.callback_query) await handleCallbackQuery(token, update.callback_query);
 }
