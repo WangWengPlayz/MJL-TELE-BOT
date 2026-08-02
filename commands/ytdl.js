@@ -2,8 +2,9 @@ const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
 
-const TMP_DIR = path.join(__dirname, 'cache', 'tmp');
-if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
+// ── Changed: Save directly in the 'cache' folder instead of 'cache/tmp' ──────
+const CACHE_DIR = path.join(__dirname, 'cache');
+if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const API_BASE        = 'https://yt-dlp-stream.onrender.com/api/v2/q?=';
 const SEARCH_API_BASE = 'https://yt-dlp-stream.onrender.com/api/v3/q?=';
@@ -76,7 +77,7 @@ async function showFormatPicker(ctx, statusMessageId, initiatorId, data) {
   if (data.media.mp4) buttons.push({ text: '🎥 MP4', callback_data: `ytdl:mp4:${requestId}` });
   if (data.media.mp3) buttons.push({ text: '🎵 MP3', callback_data: `ytdl:mp3:${requestId}` });
 
-  const thumb = data.thumbnail ? `\n🖼 <a href="${data.thumbnail}">​</a>` : '';
+  const thumb = data.thumbnail ? `\n🖼 <a href="${data.thumbnail}"></a>` : '';
   const dur   = data.duration   ? `\n⏱ ${data.duration}`                 : '';
 
   await ctx.editText(
@@ -344,8 +345,8 @@ module.exports = {
 
     const ext         = action === 'mp4' ? '.mp4' : '.mp3';
     const filename    = `${safeFilename(state.title)}${ext}`;
-    const tmpPath     = path.join(TMP_DIR, `${requestId}${ext}`);
-    const renamedPath = path.join(TMP_DIR, filename);
+    const tmpPath     = path.join(CACHE_DIR, `${requestId}${ext}`);
+    const renamedPath = path.join(CACHE_DIR, filename);
 
     try {
       // ── Live download progress ───────────────────────────────────────────
@@ -382,7 +383,6 @@ module.exports = {
 
       const stat = fs.statSync(tmpPath);
       const size = formatBytes(stat.size);
-      const fileSizeNum = stat.size;
 
       await ctx.editText(
         state.messageId,
@@ -421,11 +421,24 @@ module.exports = {
       ).catch(() => {});
     } finally {
       processing.delete(requestId);
-      for (const e of ['.mp4', '.mp3']) {
-        const f = path.join(TMP_DIR, `${requestId}${e}`);
-        if (fs.existsSync(f)) try { fs.unlinkSync(f); } catch {}
+
+      // ── Cleanup: Auto-delete all temporary and renamed files ────────────
+      const filesToDelete = [
+        tmpPath,
+        renamedPath,
+        path.join(CACHE_DIR, `${requestId}.mp4`),
+        path.join(CACHE_DIR, `${requestId}.mp3`)
+      ];
+
+      for (const filePath of filesToDelete) {
+        if (fs.existsSync(filePath)) {
+          try {
+            fs.unlinkSync(filePath);
+          } catch (unlinkErr) {
+            console.error(`[ytdl] Failed to delete file ${filePath}:`, unlinkErr.message);
+          }
+        }
       }
-      if (fs.existsSync(renamedPath)) try { fs.unlinkSync(renamedPath); } catch {}
     }
   },
 };
