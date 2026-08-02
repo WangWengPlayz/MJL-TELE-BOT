@@ -98,10 +98,12 @@ async function showFormatPicker(ctx, statusMessageId, initiatorId, data) {
 async function downloadWithProgress(url, destPath, onProgress) {
   const res = await fetchWithRetry(url, {
     redirect: 'follow',
-    signal: AbortSignal.timeout(180_000),
+    signal: AbortSignal.timeout(300_000),
     headers: {
-      'User-Agent': 'Mozilla/5.0 (compatible; TelegramBot/1.0)',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Accept': '*/*',
+      'Accept-Encoding': 'gzip, deflate',
+      'Connection': 'keep-alive',
     },
   });
 
@@ -110,15 +112,15 @@ async function downloadWithProgress(url, destPath, onProgress) {
   const contentType   = res.headers.get('content-type') || '';
   const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
 
-  if (contentType.includes('text/html')) {
-    throw new Error('Server returned a webpage instead of the media file. The link may have expired.');
+  if (contentType.includes('text/html') || contentType.includes('application/json')) {
+    throw new Error('Server returned a webpage/JSON instead of media. Link may have expired.');
   }
 
   // Pre-flight size check — reject before wasting bandwidth
   if (contentLength > 0 && contentLength > TG_MAX_BYTES) {
     throw new Error(
-      `File is too large to upload via Telegram (${formatBytes(contentLength)} > 50 MB limit). ` +
-      `Try a lower-quality version or shorter video.`
+      `File is too large (${formatBytes(contentLength)} > 50 MB limit). ` +
+      `Try a lower resolution or shorter video.`
     );
   }
 
@@ -130,27 +132,33 @@ async function downloadWithProgress(url, destPath, onProgress) {
   let lastUpdate = Date.now();
 
   while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    chunks.push(value);
-    received += value.length;
+    try {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.length;
 
-    // Hard-abort if we somehow pass the limit mid-stream
-    if (received > TG_MAX_BYTES) {
-      throw new Error(`File exceeds the 50 MB Telegram upload limit. Download aborted.`);
-    }
+      // Hard-abort if we somehow pass the limit mid-stream
+      if (received > TG_MAX_BYTES) {
+        reader.cancel();
+        throw new Error(`File exceeds 50 MB limit. Download aborted at ${formatBytes(received)}.`);
+      }
 
-    const now = Date.now();
-    if (onProgress && now - lastUpdate > 2000) {
-      lastUpdate = now;
-      await onProgress(received, contentLength).catch(() => {});
+      const now = Date.now();
+      if (onProgress && now - lastUpdate > 1000) {
+        lastUpdate = now;
+        await onProgress(received, contentLength).catch(() => {});
+      }
+    } catch (err) {
+      reader.cancel();
+      throw err;
     }
   }
 
   const buffer = Buffer.concat(chunks);
 
   if (buffer.length < 1024) {
-    throw new Error(`Downloaded file is suspiciously small (${buffer.length} bytes) — likely not real media.`);
+    throw new Error(`Downloaded file is suspiciously small (${buffer.length} bytes).`);
   }
 
   fs.writeFileSync(destPath, buffer);
@@ -342,50 +350,68 @@ module.exports = {
     try {
       // ── Live download progress ───────────────────────────────────────────
       let lastText = '';
+      let lastUpdateTime = 0;
       await downloadWithProgress(downloadUrl, tmpPath, async (received, total) => {
         const receivedStr = formatBytes(received);
+        const totalStr = formatBytes(total);
         const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;
+        
+        // Progress bar visualization
+        const barLength = 15;
+        const filled = Math.floor((pct / 100) * barLength);
         const bar = pct !== null
-          ? '▰'.repeat(Math.floor(pct / 10)) + '▱'.repeat(10 - Math.floor(pct / 10))
-          : null;
+          ? '[' + '█'.repeat(filled) + '░'.repeat(barLength - filled) + ']'
+          : '[░░░░░░░░░░░░░░░]';
+
+        const eta = total > 0 && received > 0
+          ? Math.round((total - received) / (received / (Date.now() / 1000)))
+          : 0;
+        const etaStr = eta > 0 ? `\n⏱ ETA: ~${eta}s` : '';
 
         const text = pct !== null
-          ? `⏳ Downloading…\n\n🎬 <b>${state.title}</b>\n📁 Format: ${action.toUpperCase()}\n\n${bar} ${pct}%\n📦 ${receivedStr} / ${formatBytes(total)}`
-          : `⏳ Downloading…\n\n🎬 <b>${state.title}</b>\n📁 Format: ${action.toUpperCase()}\n\n📦 ${receivedStr} received…`;
+          ? `⏳ Downloading…\n\n🎬 <b>${state.title.slice(0, 40)}${state.title.length > 40 ? '...' : ''}</b>\n📁 Format: ${action.toUpperCase()}\n\n${bar} ${pct}%\n[${receivedStr} / ${totalStr}]${etaStr}`
+          : `⏳ Downloading…\n\n🎬 <b>${state.title.slice(0, 40)}${state.title.length > 40 ? '...' : ''}</b>\n📁 Format: ${action.toUpperCase()}\n\n📦 ${receivedStr} received…`;
 
-        if (text !== lastText) {
+        const now = Date.now();
+        if (text !== lastText && now - lastUpdateTime > 1500) {
           lastText = text;
-          await ctx.editText(state.messageId, text, { parse_mode: 'HTML' });
+          lastUpdateTime = now;
+          await ctx.editText(state.messageId, text, { parse_mode: 'HTML' }).catch(() => {});
         }
       });
 
       const stat = fs.statSync(tmpPath);
       const size = formatBytes(stat.size);
+      const fileSizeNum = stat.size;
 
       await ctx.editText(
         state.messageId,
-        `📤 Uploading to Telegram…\n\n🎬 <b>${state.title}</b>\n📦 ${size}`,
+        `📤 Uploading to Telegram…\n\n🎬 <b>${state.title.slice(0, 40)}${state.title.length > 40 ? '...' : ''}</b>\n📦 ${size}`,
         { parse_mode: 'HTML' }
       );
 
       const telegramType = action === 'mp4' ? 'video' : 'audio';
       const caption = [
-        `🎬 <b>${state.title}</b>`,
+        `🎬 ${state.title}`,
         `📁 ${action.toUpperCase()}  •  📦 ${size}`,
-        ``,
-        `🤖 <i>MJL Bot</i>`,
+        `🤖 MJL Bot`,
       ].join('\n');
 
       fs.renameSync(tmpPath, renamedPath);
 
+      // For MP4 videos: use supports_streaming for better experience
+      const sendOpts = action === 'mp4'
+        ? { caption, parse_mode: 'HTML', supports_streaming: true, thumb: null }
+        : { caption, parse_mode: 'HTML' };
+
       await Promise.race([
-        ctx.sendMediaFile(renamedPath, telegramType, { caption, parse_mode: 'HTML' }),
+        ctx.sendMediaFile(renamedPath, telegramType, sendOpts),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Upload to Telegram timed out after 3 minutes')), 180_000)
+          setTimeout(() => reject(new Error('Upload to Telegram timed out after 5 minutes')), 300_000)
         ),
       ]);
 
-      await ctx.editText(state.messageId, '✅ Done! File sent above.');
+      await ctx.editText(state.messageId, `✅ Done! File sent (${size})`);
     } catch (err) {
       console.error('[ytdl] Error:', err.message);
       await ctx.editText(
