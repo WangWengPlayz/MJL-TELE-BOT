@@ -1,25 +1,31 @@
 // ============================================================
 //  /link — detect a replied file's type and convert it
+//  (debug mode: verbose errors/warnings sent to chat)
 // ============================================================
 
 const { exec } = require('child_process');
 const util = require('util');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const execAsync = util.promisify(exec);
 
-// Short-lived cache so callback_data stays under Telegram's 64-byte limit.
-// key: short id → { type, file, chatId, messageId, expires }
-const fileCache = new Map();
+// Shared cache module (per your note) instead of a local Map.
+const cache = require('../commands/cache');
+
+const CACHE_PREFIX = 'link:';
 const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+
+// Toggle this (or wire it to a config/env var) to turn debug output on/off.
+let DEBUG = false;
 
 module.exports = {
   name:        'link',
   execute,
 
-  version:     '2.0.0',
+  version:     '2.1.0',
   description: 'Reply to a file to detect its type, then convert it to another format.',
-  usage:       '/link (as a reply to a photo/video/document/audio/voice/animation)',
+  usage:       '/link (as a reply to a file) | /link debug on|off',
   category:    'Utility',
   aliases:     ['detect', 'ftype', 'convert'],
 
@@ -29,12 +35,22 @@ module.exports = {
 
 // ── Main handler ─────────────────────────────────────────────────────────
 async function execute(ctx) {
-  const { raw: msg } = ctx;
+  const { args, raw: msg } = ctx;
+
+  // ── /link debug on|off ────────────────────────────────────
+  if (args[0] === 'debug') {
+    DEBUG = args[1] === 'on';
+    await ctx.reply(`🐞 Debug mode ${DEBUG ? 'enabled ✅' : 'disabled ❌'}`);
+    return;
+  }
+
   const target = msg.reply_to_message;
 
-  // No reply → nothing to do, just clean the chat up.
   if (!target) {
-    await ctx.deleteMessage(msg.message_id);
+    if (DEBUG) {
+      await ctx.reply('⚠️ [debug] /link used without a reply — nothing to detect. Deleting message.');
+    }
+    await safe(ctx, () => ctx.deleteMessage(msg.message_id));
     return;
   }
 
@@ -42,6 +58,7 @@ async function execute(ctx) {
 
   const detected = detectFileType(target);
   if (!detected) {
+    await warn(ctx, 'No recognizable file found in the replied message.', { messageKeys: Object.keys(target) });
     await ctx.reply('❌ No recognizable file found in that message.');
     return;
   }
@@ -50,14 +67,12 @@ async function execute(ctx) {
   const options = getConversionOptions(kind);
 
   const cacheId = makeId();
-  fileCache.set(cacheId, {
+  await safe(ctx, () => cache.set(CACHE_PREFIX + cacheId, {
     kind,
     file,
     chatId: msg.chat.id,
     messageId: target.message_id,
-    expires: Date.now() + CACHE_TTL_MS,
-  });
-  cleanupCache();
+  }, CACHE_TTL_MS), 'cache.set failed while storing file entry');
 
   const lines = [
     `📁 <b>Detected type:</b> ${type}`,
@@ -66,6 +81,10 @@ async function execute(ctx) {
     file.file_size  ? `📦 <b>Size:</b> ${formatBytes(file.file_size)}` : null,
     extra || null,
   ].filter(Boolean);
+
+  if (DEBUG) {
+    lines.push(`\n🐞 <b>[debug]</b> kind=<code>${kind}</code> cacheId=<code>${cacheId}</code> options=<code>${options.map(o => o.format).join(',') || 'none'}</code>`);
+  }
 
   if (!options.length) {
     lines.push('\nℹ️ No conversions available for this file type.');
@@ -88,32 +107,39 @@ async function execute(ctx) {
 // ── Callback handler ────────────────────────────────────────────────────
 async function onCallback(ctx, cq) {
   const [, cacheId, format] = cq.data.split(':');
-  const entry = fileCache.get(cacheId);
+  const entry = await safe(ctx, () => cache.get(CACHE_PREFIX + cacheId), 'cache.get failed in onCallback');
 
-  if (!entry || entry.expires < Date.now()) {
+  if (!entry) {
     await ctx.answerCallback(cq.id, '⚠️ This request expired, run /link again.', true);
+    if (DEBUG) await ctx.reply(`🐞 [debug] cache miss for cacheId=${cacheId}`);
     return;
   }
 
   if (format === 'cancel') {
     await ctx.answerCallback(cq.id, 'Cancelled.');
     await ctx.deleteMessage(ctx.messageId);
-    fileCache.delete(cacheId);
+    await safe(ctx, () => cache.delete(CACHE_PREFIX + cacheId));
     return;
   }
 
   await ctx.answerCallback(cq.id, `Converting to ${format}...`);
   await ctx.editText(ctx.messageId, `⏳ Converting to <b>${format}</b>...`, { parse_mode: 'HTML' });
 
-  const tmpDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'link-'));
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'link-'));
   const inputPath = path.join(tmpDir, `input${extOf(entry.file.file_name) || ''}`);
   const outputPath = path.join(tmpDir, `output.${format}`);
 
   try {
     await ctx.downloadFile(entry.file.file_id, inputPath);
 
-    // Requires ffmpeg installed on the host.
-    await execAsync(`ffmpeg -y -i "${inputPath}" "${outputPath}"`);
+    const ffmpegCmd = `ffmpeg -y -i "${inputPath}" "${outputPath}"`;
+    if (DEBUG) await ctx.reply(`🐞 [debug] running: <code>${escapeHtml(ffmpegCmd)}</code>`, { parse_mode: 'HTML' });
+
+    const { stdout, stderr } = await execAsync(ffmpegCmd);
+
+    if (DEBUG && stderr) {
+      await sendChunked(ctx, `🐞 [debug] ffmpeg stderr (usually just progress/log, not fatal):\n<code>${escapeHtml(stderr)}</code>`);
+    }
 
     const sendType = guessSendType(format);
     await ctx.sendMediaFile(outputPath, sendType, {
@@ -123,9 +149,54 @@ async function onCallback(ctx, cq) {
     await ctx.editText(ctx.messageId, `✅ Done — converted to <b>${format}</b>.`, { parse_mode: 'HTML' });
   } catch (err) {
     await ctx.editText(ctx.messageId, `❌ Conversion failed: <code>${escapeHtml(err.message)}</code>`, { parse_mode: 'HTML' });
+
+    if (DEBUG) {
+      const details = [
+        `🐞 <b>[debug] Conversion error</b>`,
+        `<b>Message:</b> <code>${escapeHtml(err.message)}</code>`,
+        err.cmd ? `<b>Command:</b> <code>${escapeHtml(err.cmd)}</code>` : null,
+        err.code !== undefined ? `<b>Exit code:</b> <code>${err.code}</code>` : null,
+        err.stderr ? `<b>stderr:</b>\n<code>${escapeHtml(String(err.stderr).slice(0, 1500))}</code>` : null,
+      ].filter(Boolean).join('\n');
+      await sendChunked(ctx, details);
+    }
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
-    fileCache.delete(cacheId);
+    await safe(ctx, () => cache.delete(CACHE_PREFIX + cacheId));
+  }
+}
+
+// ── Debug helpers ────────────────────────────────────────────────────────
+
+// Wrap a step; on failure, log to chat if DEBUG, otherwise swallow/log to console.
+async function safe(ctx, fn, label = '') {
+  try {
+    return await fn();
+  } catch (err) {
+    console.error(`[link] ${label}:`, err);
+    if (DEBUG) {
+      await ctx.reply(
+        `🐞 <b>[debug] ${escapeHtml(label || 'Error')}</b>\n<code>${escapeHtml(err.message)}</code>`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {}); // never let debug logging itself crash the handler
+    }
+    return null;
+  }
+}
+
+// Log a non-fatal warning — only visible in chat when DEBUG is on.
+async function warn(ctx, message, meta) {
+  console.warn(`[link] WARN: ${message}`, meta || '');
+  if (DEBUG) {
+    const extra = meta ? `\n<code>${escapeHtml(JSON.stringify(meta))}</code>` : '';
+    await ctx.reply(`⚠️ <b>[debug warn]</b> ${escapeHtml(message)}${extra}`, { parse_mode: 'HTML' }).catch(() => {});
+  }
+}
+
+// Telegram messages cap at 4096 chars — split long debug dumps.
+async function sendChunked(ctx, text, limit = 3500) {
+  for (let i = 0; i < text.length; i += limit) {
+    await ctx.reply(text.slice(i, i + limit), { parse_mode: 'HTML' }).catch(() => {});
   }
 }
 
@@ -190,7 +261,7 @@ function getConversionOptions(kind) {
       { label: '🖼 JPG', format: 'jpg' },
       { label: '🖼 PNG', format: 'png' },
     ];
-    default: return []; // e.g. archives, code, unknown docs — no conversion offered
+    default: return [];
   }
 }
 
@@ -226,13 +297,6 @@ function extOf(filename) {
 
 function makeId() {
   return Math.random().toString(36).slice(2, 8);
-}
-
-function cleanupCache() {
-  const now = Date.now();
-  for (const [id, entry] of fileCache) {
-    if (entry.expires < now) fileCache.delete(id);
-  }
 }
 
 function formatBytes(bytes) {
