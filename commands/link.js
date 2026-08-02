@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 const execAsync = util.promisify(exec);
 
-const cache = require('cache');
+const cache = require('./cache');
 
 const CACHE_PREFIX = 'link:';
 const CACHE_TTL_MS = 5 * 60 * 1000;
