@@ -28,6 +28,18 @@ const FORMATS = [
 
 const FORMAT_MAP = Object.fromEntries(FORMATS.map(f => [f.id, f]));
 
+// ── Timeout helper ──────────────────────────────────────────────────────────
+
+const CONVERT_TIMEOUT_MS = 5 * 60 * 1000; // 5 minutes — tune as needed
+
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function formatBytes(bytes) {
@@ -90,6 +102,8 @@ function buildFormatKeyboard(requestId) {
 
 function mapErrorToUserMessage(err) {
   const msg = err.message || '';
+  if (msg.includes('timed out'))
+    return 'The conversion took too long and was aborted. The file may be too large or the server is overloaded.';
   if (msg.includes('FFmpeg failed to start') || (msg.includes('ENOENT') && msg.includes('ffmpeg')))
     return 'FFmpeg is not installed on this server. Contact the bot admin.';
   if (msg.includes('FFmpeg exited'))
@@ -221,14 +235,18 @@ module.exports = {
         if (fmt.id === 'mp4') {
           if (media.kind === 'audio') {
             // Audio → MP4 with black background
-            await audioToMp4(srcPath, outPath);
+            await withTimeout(audioToMp4(srcPath, outPath), CONVERT_TIMEOUT_MS, 'Conversion');
           } else {
             // Video → MP4 (fast copy, falls back to re-encode)
-            await videoToMp4Fast(srcPath, outPath);
+            await withTimeout(videoToMp4Fast(srcPath, outPath), CONVERT_TIMEOUT_MS, 'Conversion');
           }
         } else {
           // Any → audio format
-          await convertAudio(srcPath, outPath, fmt.id === 'aac' ? 'aac' : fmt.id);
+          await withTimeout(
+            convertAudio(srcPath, outPath, fmt.id === 'aac' ? 'aac' : fmt.id),
+            CONVERT_TIMEOUT_MS,
+            'Conversion'
+          );
         }
       }
 
