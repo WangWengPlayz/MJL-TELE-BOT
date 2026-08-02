@@ -2,14 +2,12 @@ const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
 
-// ── Changed: Save directly in the 'cache' folder instead of 'cache/tmp' ──────
 const CACHE_DIR = path.join(__dirname, 'cache');
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
 const API_BASE        = 'https://yt-dlp-stream.onrender.com/api/v2/q?=';
 const SEARCH_API_BASE = 'https://yt-dlp-stream.onrender.com/api/v3/q?=';
 
-// Telegram bot upload limit (50 MB)
 const TG_MAX_BYTES = 50 * 1024 * 1024;
 
 const pending        = new Map();
@@ -28,6 +26,29 @@ function formatBytes(bytes) {
 
 function safeFilename(title) {
   return title.replace(/[/\\?%*:|"<>\r\n]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+}
+
+/** Spinner-style loading animation driven by repeated editText calls.
+ *  Returns a stop() function — always call it before the next edit
+ *  to that message, or the animation frame can clobber your content. */
+function startLoadingAnimation(ctx, messageId, label, intervalMs = 500) {
+  const frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+  let i = 0;
+  let stopped = false;
+
+  const tick = async () => {
+    if (stopped) return;
+    await ctx.editText(messageId, `${frames[i % frames.length]} ${label}`, { parse_mode: 'HTML' }).catch(() => {});
+    i++;
+  };
+
+  tick(); // fire immediately so it doesn't look frozen for the first interval
+  const handle = setInterval(tick, intervalMs);
+
+  return () => {
+    stopped = true;
+    clearInterval(handle);
+  };
 }
 
 /** Fetch with a single automatic retry on network/5xx failure. */
@@ -117,7 +138,6 @@ async function downloadWithProgress(url, destPath, onProgress) {
     throw new Error('Server returned a webpage/JSON instead of media. Link may have expired.');
   }
 
-  // Pre-flight size check — reject before wasting bandwidth
   if (contentLength > 0 && contentLength > TG_MAX_BYTES) {
     throw new Error(
       `File is too large (${formatBytes(contentLength)} > 50 MB limit). ` +
@@ -139,7 +159,6 @@ async function downloadWithProgress(url, destPath, onProgress) {
       chunks.push(value);
       received += value.length;
 
-      // Hard-abort if we somehow pass the limit mid-stream
       if (received > TG_MAX_BYTES) {
         reader.cancel();
         throw new Error(`File exceeds 50 MB limit. Download aborted at ${formatBytes(received)}.`);
@@ -176,7 +195,7 @@ setInterval(() => {
 // ── Command export ────────────────────────────────────────────────────────────
 module.exports = {
   name:           'ytdl',
-  version:        '3.0.0',
+  version:        '3.1.0',
   description:    'Download YouTube videos or audio. Supports direct URLs and keyword search.',
   usage:          '/ytdl <url or title>  |  /ytdl -s <search query>',
   aliases:        ['yt', 'youtube'],
@@ -210,6 +229,7 @@ module.exports = {
     }
 
     const status = await ctx.reply(isSearch ? '🔍 Searching…' : '🔍 Looking up…');
+    const stopLoading = startLoadingAnimation(ctx, status.message_id, isSearch ? 'Searching…' : 'Looking up…');
 
     // ── SEARCH MODE ────────────────────────────────────────────────────────
     if (isSearch) {
@@ -224,9 +244,12 @@ module.exports = {
           throw new Error('No results found for that query.');
         }
       } catch (err) {
+        stopLoading();
         await ctx.editText(status.message_id, `❌ Search failed: ${err.message}`);
         return;
       }
+
+      stopLoading();
 
       const results   = data.results.slice(0, 8);
       const requestId = crypto.randomBytes(6).toString('hex');
@@ -268,10 +291,12 @@ module.exports = {
     try {
       data = await fetchMedia(query);
     } catch (err) {
+      stopLoading();
       await ctx.editText(status.message_id, `❌ Lookup failed: ${err.message}`);
       return;
     }
 
+    stopLoading();
     await showFormatPicker(ctx, status.message_id, msg.from.id, data);
   },
 
@@ -299,12 +324,17 @@ module.exports = {
 
       pendingSearch.delete(requestId);
       await ctx.answerCallback(cq.id);
-      await ctx.editText(searchState.messageId, `⏳ Fetching media for:\n<b>${chosen.title}</b>`, { parse_mode: 'HTML' });
+
+      const stopLoading = startLoadingAnimation(
+        ctx, searchState.messageId, `Fetching media for:\n<b>${chosen.title}</b>`
+      );
 
       try {
         const data = await fetchMedia(chosen.url || chosen.title);
+        stopLoading();
         await showFormatPicker(ctx, searchState.messageId, searchState.initiatorId, data);
       } catch (err) {
+        stopLoading();
         await ctx.editText(searchState.messageId, `❌ Failed to fetch media: ${err.message}`).catch(() => {});
       }
       return;
@@ -356,10 +386,9 @@ module.exports = {
         const receivedStr = formatBytes(received);
         const totalStr = formatBytes(total);
         const pct = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;
-        
-        // Progress bar visualization
+
         const barLength = 15;
-        const filled = Math.floor((pct / 100) * barLength);
+        const filled = pct !== null ? Math.floor((pct / 100) * barLength) : 0;
         const bar = pct !== null
           ? '[' + '█'.repeat(filled) + '░'.repeat(barLength - filled) + ']'
           : '[░░░░░░░░░░░░░░░]';
@@ -384,10 +413,11 @@ module.exports = {
       const stat = fs.statSync(tmpPath);
       const size = formatBytes(stat.size);
 
-      await ctx.editText(
+      // ── Animated spinner during upload (no byte-level progress available) ──
+      const stopUploadAnim = startLoadingAnimation(
+        ctx,
         state.messageId,
-        `📤 Uploading to Telegram…\n\n🎬 <b>${state.title.slice(0, 40)}${state.title.length > 40 ? '...' : ''}</b>\n📦 ${size}`,
-        { parse_mode: 'HTML' }
+        `Uploading to Telegram…\n\n🎬 <b>${state.title.slice(0, 40)}${state.title.length > 40 ? '...' : ''}</b>\n📦 ${size}`
       );
 
       const telegramType = action === 'mp4' ? 'video' : 'audio';
@@ -399,17 +429,20 @@ module.exports = {
 
       fs.renameSync(tmpPath, renamedPath);
 
-      // For MP4 videos: use supports_streaming for better experience
       const sendOpts = action === 'mp4'
         ? { caption, parse_mode: 'HTML', supports_streaming: true, thumb: null }
         : { caption, parse_mode: 'HTML' };
 
-      await Promise.race([
-        ctx.sendMediaFile(renamedPath, telegramType, sendOpts),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Upload to Telegram timed out after 5 minutes')), 300_000)
-        ),
-      ]);
+      try {
+        await Promise.race([
+          ctx.sendMediaFile(renamedPath, telegramType, sendOpts),
+          new Promise((_, reject) =>
+            setTimeout(() => reject(new Error('Upload to Telegram timed out after 5 minutes')), 300_000)
+          ),
+        ]);
+      } finally {
+        stopUploadAnim();
+      }
 
       await ctx.editText(state.messageId, `✅ Done! File sent (${size})`);
     } catch (err) {
@@ -422,7 +455,6 @@ module.exports = {
     } finally {
       processing.delete(requestId);
 
-      // ── Cleanup: Auto-delete all temporary and renamed files ────────────
       const filesToDelete = [
         tmpPath,
         renamedPath,
