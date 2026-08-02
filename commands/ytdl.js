@@ -1,5 +1,5 @@
-const fs   = require('fs');
-const path = require('path');
+const fs     = require('fs');
+const path   = require('path');
 const crypto = require('crypto');
 
 const TMP_DIR = path.join(__dirname, 'cache', 'tmp');
@@ -8,9 +8,14 @@ if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 const API_BASE        = 'https://yt-dlp-stream.onrender.com/api/v2/q?=';
 const SEARCH_API_BASE = 'https://yt-dlp-stream.onrender.com/api/v3/q?=';
 
+// Telegram bot upload limit (50 MB)
+const TG_MAX_BYTES = 50 * 1024 * 1024;
+
 const pending        = new Map();
 const pendingSearch  = new Map();
 const processing     = new Set();
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
 
 function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
@@ -24,14 +29,34 @@ function safeFilename(title) {
   return title.replace(/[/\\?%*:|"<>\r\n]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
+/** Fetch with a single automatic retry on network/5xx failure. */
+async function fetchWithRetry(url, opts = {}, retries = 2) {
+  let lastErr;
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await fetch(url, opts);
+      if (!res.ok && res.status >= 500 && i < retries - 1) {
+        lastErr = new Error(`API returned HTTP ${res.status}`);
+        await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+        continue;
+      }
+      return res;
+    } catch (err) {
+      lastErr = err;
+      if (i < retries - 1) await new Promise(r => setTimeout(r, 2000 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
 async function fetchMedia(query) {
-  const res = await fetch(`${API_BASE}${encodeURIComponent(query)}`, {
+  const res = await fetchWithRetry(`${API_BASE}${encodeURIComponent(query)}`, {
     signal: AbortSignal.timeout(60_000),
   });
-  if (!res.ok) throw new Error(`API returned HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`Media API returned HTTP ${res.status}. The backend may be waking up — try again in a moment.`);
   const data = await res.json();
   if (!data.title || (!data.media?.mp4 && !data.media?.mp3)) {
-    throw new Error('No media found for that query.');
+    throw new Error('No downloadable media found for that query.');
   }
   return data;
 }
@@ -51,9 +76,12 @@ async function showFormatPicker(ctx, statusMessageId, initiatorId, data) {
   if (data.media.mp4) buttons.push({ text: '🎥 MP4', callback_data: `ytdl:mp4:${requestId}` });
   if (data.media.mp3) buttons.push({ text: '🎵 MP3', callback_data: `ytdl:mp3:${requestId}` });
 
+  const thumb = data.thumbnail ? `\n🖼 <a href="${data.thumbnail}">​</a>` : '';
+  const dur   = data.duration   ? `\n⏱ ${data.duration}`                 : '';
+
   await ctx.editText(
     statusMessageId,
-    `🎬 <b>${data.title}</b>\n\nChoose output format:`,
+    `🎬 <b>${data.title}</b>${dur}\n\nChoose output format:${thumb}`,
     {
       parse_mode: 'HTML',
       reply_markup: {
@@ -66,13 +94,12 @@ async function showFormatPicker(ctx, statusMessageId, initiatorId, data) {
   );
 }
 
-// ── Download with redirect-follow + validation + live progress ──────
+// ── Download with redirect-follow + validation + live progress ────────────────
 async function downloadWithProgress(url, destPath, onProgress) {
-  const res = await fetch(url, {
-    redirect: 'follow', // some hosts trigger download via redirect
+  const res = await fetchWithRetry(url, {
+    redirect: 'follow',
     signal: AbortSignal.timeout(180_000),
     headers: {
-      // some auto-download endpoints check UA / accept headers
       'User-Agent': 'Mozilla/5.0 (compatible; TelegramBot/1.0)',
       'Accept': '*/*',
     },
@@ -80,19 +107,26 @@ async function downloadWithProgress(url, destPath, onProgress) {
 
   if (!res.ok) throw new Error(`Download failed — HTTP ${res.status}`);
 
-  const contentType = res.headers.get('content-type') || '';
+  const contentType   = res.headers.get('content-type') || '';
   const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
 
-  // If it's HTML, the URL didn't give us the actual file — likely an interstitial page
   if (contentType.includes('text/html')) {
-    throw new Error('Server returned a webpage instead of the file (link may need direct access, not a redirect).');
+    throw new Error('Server returned a webpage instead of the media file. The link may have expired.');
+  }
+
+  // Pre-flight size check — reject before wasting bandwidth
+  if (contentLength > 0 && contentLength > TG_MAX_BYTES) {
+    throw new Error(
+      `File is too large to upload via Telegram (${formatBytes(contentLength)} > 50 MB limit). ` +
+      `Try a lower-quality version or shorter video.`
+    );
   }
 
   if (!res.body) throw new Error('No response body from download URL.');
 
-  const reader = res.body.getReader();
-  const chunks = [];
-  let received = 0;
+  const reader   = res.body.getReader();
+  const chunks   = [];
+  let received   = 0;
   let lastUpdate = Date.now();
 
   while (true) {
@@ -101,7 +135,11 @@ async function downloadWithProgress(url, destPath, onProgress) {
     chunks.push(value);
     received += value.length;
 
-    // Throttle progress updates to every ~2s to avoid Telegram rate limits
+    // Hard-abort if we somehow pass the limit mid-stream
+    if (received > TG_MAX_BYTES) {
+      throw new Error(`File exceeds the 50 MB Telegram upload limit. Download aborted.`);
+    }
+
     const now = Date.now();
     if (onProgress && now - lastUpdate > 2000) {
       lastUpdate = now;
@@ -111,21 +149,28 @@ async function downloadWithProgress(url, destPath, onProgress) {
 
   const buffer = Buffer.concat(chunks);
 
-  // Guard against empty or suspiciously tiny "files" (likely error pages)
   if (buffer.length < 1024) {
-    throw new Error(`Downloaded file too small (${buffer.length} bytes) — likely not real media.`);
+    throw new Error(`Downloaded file is suspiciously small (${buffer.length} bytes) — likely not real media.`);
   }
 
   fs.writeFileSync(destPath, buffer);
-  return buffer;
 }
 
+// ── Expire old pending requests every 10 minutes ─────────────────────────────
+setInterval(() => {
+  const ttl = 10 * 60 * 1000;
+  const now = Date.now();
+  for (const [id, s] of pending)       if (now - s.createdAt > ttl) pending.delete(id);
+  for (const [id, s] of pendingSearch) if (now - s.createdAt > ttl) pendingSearch.delete(id);
+}, 5 * 60 * 1000);
+
+// ── Command export ────────────────────────────────────────────────────────────
 module.exports = {
-  name: 'ytdl',
-  version: '1.2.0',
-  description: 'Download a YouTube video as MP4 or MP3.',
-  usage: '/ytdl <YouTube URL or video title>  |  /ytdl -search <query>  |  /ytdl -s <query>',
-  aliases: ['yt', 'youtube'],
+  name:           'ytdl',
+  version:        '3.0.0',
+  description:    'Download YouTube videos or audio. Supports direct URLs and keyword search.',
+  usage:          '/ytdl <url or title>  |  /ytdl -s <search query>',
+  aliases:        ['yt', 'youtube'],
   callbackPrefix: 'ytdl:',
 
   async execute(ctx) {
@@ -133,35 +178,38 @@ module.exports = {
 
     if (!args || args.length === 0) {
       return ctx.replyWithHTML(
-        '❌ Please provide a YouTube URL or video title.\n\n' +
-        'Example: <code>/ytdl never gonna give you up</code>\n' +
-        'Search:  <code>/ytdl -search never gonna give you up</code>'
+        '❌ <b>Usage:</b>\n' +
+        '  <code>/ytdl &lt;url or title&gt;</code>\n' +
+        '  <code>/ytdl -s &lt;search query&gt;</code>\n\n' +
+        'Examples:\n' +
+        '  <code>/ytdl https://youtu.be/dQw4w9WgXcQ</code>\n' +
+        '  <code>/ytdl never gonna give you up</code>\n' +
+        '  <code>/ytdl -s lofi hip hop</code>'
       );
     }
 
     const firstArg = args[0].toLowerCase();
     const isSearch = firstArg === '-search' || firstArg === '-s';
-    const query = (isSearch ? args.slice(1) : args).join(' ').trim();
+    const query    = (isSearch ? args.slice(1) : args).join(' ').trim();
 
-    // Fixed: explicit empty-query guard after stripping the flag
     if (query.length === 0) {
       return ctx.replyWithHTML(
         isSearch
-          ? '❌ Please provide a search query after -search/-s.\n\nExample: <code>/ytdl -search never gonna give you up</code>'
+          ? '❌ Please provide a search query after <code>-s</code>.\n\nExample: <code>/ytdl -s lofi hip hop</code>'
           : '❌ Please provide a YouTube URL or video title.\n\nExample: <code>/ytdl never gonna give you up</code>'
       );
     }
 
     const status = await ctx.reply(isSearch ? '🔍 Searching…' : '🔍 Looking up…');
 
-    // ── SEARCH MODE ────────────────────────────────────────────
+    // ── SEARCH MODE ────────────────────────────────────────────────────────
     if (isSearch) {
       let data;
       try {
-        const res = await fetch(`${SEARCH_API_BASE}${encodeURIComponent(query)}`, {
+        const res = await fetchWithRetry(`${SEARCH_API_BASE}${encodeURIComponent(query)}`, {
           signal: AbortSignal.timeout(60_000),
         });
-        if (!res.ok) throw new Error(`API returned HTTP ${res.status}`);
+        if (!res.ok) throw new Error(`Search API returned HTTP ${res.status}`);
         data = await res.json();
         if (!Array.isArray(data.results) || data.results.length === 0) {
           throw new Error('No results found for that query.');
@@ -171,7 +219,7 @@ module.exports = {
         return;
       }
 
-      const results = data.results.slice(0, 8);
+      const results   = data.results.slice(0, 8);
       const requestId = crypto.randomBytes(6).toString('hex');
       pendingSearch.set(requestId, {
         initiatorId: msg.from.id,
@@ -181,7 +229,7 @@ module.exports = {
       });
 
       const lines = results.map((r, i) =>
-        `${i + 1}. <b>${r.title}</b>\n   👤 ${r.channel_name}  •  ⏱ ${r.duration}  •  👁 ${r.views.toLocaleString()}`
+        `${i + 1}. <b>${r.title}</b>\n   👤 ${r.channel_name}  •  ⏱ ${r.duration}  •  👁 ${(r.views || 0).toLocaleString()}`
       );
 
       const buttons = results.map((r, i) => ([
@@ -190,7 +238,7 @@ module.exports = {
 
       await ctx.editText(
         status.message_id,
-        `🔎 <b>Search results for:</b> ${query}\n\n${lines.join('\n\n')}\n\nTap a number to choose:`,
+        `🔎 <b>Search results for:</b> ${query}\n\n${lines.join('\n\n')}\n\nTap a number to download:`,
         {
           parse_mode: 'HTML',
           reply_markup: {
@@ -206,12 +254,12 @@ module.exports = {
       return;
     }
 
-    // ── DIRECT MODE ─────────────────────────────────────────────
+    // ── DIRECT MODE ────────────────────────────────────────────────────────
     let data;
     try {
       data = await fetchMedia(query);
     } catch (err) {
-      await ctx.editText(status.message_id, `❌ Search failed: ${err.message}`);
+      await ctx.editText(status.message_id, `❌ Lookup failed: ${err.message}`);
       return;
     }
 
@@ -222,14 +270,14 @@ module.exports = {
     const parts  = cq.data.split(':');
     const action = parts[1];
 
-    // ── Search result pick ──────────────────────────────────────
+    // ── Search result pick ─────────────────────────────────────────────────
     if (action === 'pick') {
       const requestId   = parts[2];
       const index       = parseInt(parts[3], 10);
       const searchState = pendingSearch.get(requestId);
 
       if (!searchState) {
-        return ctx.answerCallback(cq.id, '⏱ This search has expired.', true);
+        return ctx.answerCallback(cq.id, '⏱ This search has expired. Run /ytdl -s again.', true);
       }
       if (cq.from.id !== searchState.initiatorId) {
         return ctx.answerCallback(cq.id, '🚫 Only the person who searched can choose.', true);
@@ -253,8 +301,9 @@ module.exports = {
       return;
     }
 
+    // ── Cancel ─────────────────────────────────────────────────────────────
     const requestId = parts[2];
-    const state      = pending.get(requestId);
+    const state     = pending.get(requestId);
 
     if (!state) {
       return ctx.answerCallback(cq.id, '⏱ This request has expired.', true);
@@ -263,12 +312,11 @@ module.exports = {
       return ctx.answerCallback(cq.id, '🚫 Only the person who ran /ytdl can choose.', true);
     }
     if (processing.has(requestId)) {
-      return ctx.answerCallback(cq.id, '⏳ Already processing, please wait.', true);
+      return ctx.answerCallback(cq.id, '⏳ Already processing — please wait.', true);
     }
 
     if (action === 'cancel') {
       pending.delete(requestId);
-      pendingSearch.delete(requestId);
       await ctx.answerCallback(cq.id);
       return ctx.editText(state.messageId, '❌ Download cancelled.');
     }
@@ -279,19 +327,20 @@ module.exports = {
 
     const downloadUrl = action === 'mp4' ? state.mp4Url : state.mp3Url;
     if (!downloadUrl) {
-      return ctx.answerCallback(cq.id, `No ${action.toUpperCase()} link available.`, true);
+      return ctx.answerCallback(cq.id, `No ${action.toUpperCase()} link available for this video.`, true);
     }
 
     processing.add(requestId);
     pending.delete(requestId);
     await ctx.answerCallback(cq.id);
 
-    const ext      = action === 'mp4' ? '.mp4' : '.mp3';
-    const filename = `${safeFilename(state.title)}${ext}`;
-    const tmpPath  = path.join(TMP_DIR, `${requestId}${ext}`);
+    const ext         = action === 'mp4' ? '.mp4' : '.mp3';
+    const filename    = `${safeFilename(state.title)}${ext}`;
+    const tmpPath     = path.join(TMP_DIR, `${requestId}${ext}`);
+    const renamedPath = path.join(TMP_DIR, filename);
 
     try {
-      // ── Live-updating download progress ─────────────────────────
+      // ── Live download progress ───────────────────────────────────────────
       let lastText = '';
       await downloadWithProgress(downloadUrl, tmpPath, async (received, total) => {
         const receivedStr = formatBytes(received);
@@ -302,9 +351,8 @@ module.exports = {
 
         const text = pct !== null
           ? `⏳ Downloading…\n\n🎬 <b>${state.title}</b>\n📁 Format: ${action.toUpperCase()}\n\n${bar} ${pct}%\n📦 ${receivedStr} / ${formatBytes(total)}`
-          : `⏳ Downloading…\n\n🎬 <b>${state.title}</b>\n📁 Format: ${action.toUpperCase()}\n\n📦 ${receivedStr} received (size unknown)`;
+          : `⏳ Downloading…\n\n🎬 <b>${state.title}</b>\n📁 Format: ${action.toUpperCase()}\n\n📦 ${receivedStr} received…`;
 
-        // Avoid redundant edits (Telegram rate-limits identical/rapid edits)
         if (text !== lastText) {
           lastText = text;
           await ctx.editText(state.messageId, text, { parse_mode: 'HTML' });
@@ -324,16 +372,16 @@ module.exports = {
       const caption = [
         `🎬 <b>${state.title}</b>`,
         `📁 ${action.toUpperCase()}  •  📦 ${size}`,
+        ``,
+        `🤖 <i>MJL Bot</i>`,
       ].join('\n');
 
-      const renamedPath = path.join(TMP_DIR, filename);
       fs.renameSync(tmpPath, renamedPath);
 
-      // Guard the upload itself with a timeout so it can't hang forever
       await Promise.race([
         ctx.sendMediaFile(renamedPath, telegramType, { caption, parse_mode: 'HTML' }),
         new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Upload to Telegram timed out after 120s')), 120_000)
+          setTimeout(() => reject(new Error('Upload to Telegram timed out after 3 minutes')), 180_000)
         ),
       ]);
 
@@ -342,16 +390,16 @@ module.exports = {
       console.error('[ytdl] Error:', err.message);
       await ctx.editText(
         state.messageId,
-        `❌ Failed: ${err.message}`
+        `❌ <b>Failed:</b> ${err.message}`,
+        { parse_mode: 'HTML' }
       ).catch(() => {});
     } finally {
       processing.delete(requestId);
-      for (const ext of ['.mp4', '.mp3']) {
-        const f = path.join(TMP_DIR, `${requestId}${ext}`);
+      for (const e of ['.mp4', '.mp3']) {
+        const f = path.join(TMP_DIR, `${requestId}${e}`);
         if (fs.existsSync(f)) try { fs.unlinkSync(f); } catch {}
       }
-      const renamed = path.join(TMP_DIR, filename);
-      if (fs.existsSync(renamed)) try { fs.unlinkSync(renamed); } catch {}
+      if (fs.existsSync(renamedPath)) try { fs.unlinkSync(renamedPath); } catch {}
     }
   },
 };

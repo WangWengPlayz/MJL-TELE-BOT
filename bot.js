@@ -130,9 +130,19 @@ async function downloadTelegramFile(token, fileId, destPath) {
 
 // Upload a local file to Telegram as video or audio
 async function sendMediaFile(token, chatId, filePath, type, extra = {}) {
-  const method = type === 'video' ? 'sendVideo' : 'sendAudio';
-  const fieldName = type === 'video' ? 'video' : 'audio';
+  const TYPE_MAP = {
+    video:      { method: 'sendVideo',     field: 'video'      },
+    audio:      { method: 'sendAudio',     field: 'audio'      },
+    photo:      { method: 'sendPhoto',     field: 'photo'      },
+    document:   { method: 'sendDocument',  field: 'document'   },
+    voice:      { method: 'sendVoice',     field: 'voice'      },
+    video_note: { method: 'sendVideoNote', field: 'video_note' },
+  };
 
+  const mapped = TYPE_MAP[type];
+  if (!mapped) throw new Error(`Unsupported media type for sendMediaFile: "${type}". Supported: ${Object.keys(TYPE_MAP).join(', ')}`);
+
+  const { method, field: fieldName } = mapped;
   const fileBuffer = fs.readFileSync(filePath);
   const fileName = path.basename(filePath);
 
@@ -426,6 +436,13 @@ async function poll(token) {
         else if (update.callback_query) await handleCallbackQuery(token, update.callback_query);
       }
     } catch (err) {
+      // 409 Conflict = another instance (e.g. Render deployment) is already polling.
+      // Stop this instance immediately rather than fighting in a retry loop.
+      if (err.message && err.message.includes('Conflict:')) {
+        console.error('[bot] Polling conflict — another instance is already running. Stopping local polling.');
+        running = false;
+        return;
+      }
       console.error('Polling error:', err.message);
       console.log(`Retrying in ${backoff / 1000}s...`);
       await sleep(backoff);
