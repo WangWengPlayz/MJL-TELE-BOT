@@ -1,10 +1,10 @@
 // ============================================================
-//  COMMAND  —  link
-//  Reply to a media file  OR  /link <url>
-//  Shows conversion buttons (MP3 ↔ MP4)
+//  COMMAND  —  link  v1.2
+//  Reply to media  OR  /link <url>
+//  Smart buttons + Cancel + edit-based status
 // ============================================================
 
-const fs = require('fs');
+const fs   = require('fs');
 const path = require('path');
 const { execFile } = require('child_process');
 const { promisify } = require('util');
@@ -13,15 +13,15 @@ const execFileAsync = promisify(execFile);
 const CACHE_DIR = path.join(__dirname, 'cache');
 
 module.exports = {
-  name: 'link',
+  name:    'link',
   execute,
-  
-  version: '1.1.0',
-  description: 'Convert MP3 ↔ MP4 (reply to file or give URL)',
-  usage: '/link  (reply to media)   or   /link <url>',
-  category: 'Media',
-  aliases: ['convert', 'cv'],
-  
+
+  version:     '1.2.0',
+  description: 'Convert audio ↔ video (reply to file or give URL)',
+  usage:       '/link  (reply to media)   or   /link <url>',
+  category:    'Media',
+  aliases:     ['convert', 'cv'],
+
   callbackPrefix: 'link:',
   onCallback,
 };
@@ -29,63 +29,73 @@ module.exports = {
 // ── Main handler ──────────────────────────────────────────────────────────────
 async function execute(ctx) {
   const { args, raw: msg } = ctx;
-  
-  // Ensure cache folder
+
   if (!fs.existsSync(CACHE_DIR)) {
     fs.mkdirSync(CACHE_DIR, { recursive: true });
   }
-  
+
   await ctx.chatAction('typing');
-  
-  // ── Case 1: user replied to a media message ───────────────────────────────
+
+  // ── Case 1: replied to a media message ────────────────────────────────────
   const reply = msg.reply_to_message;
   if (reply) {
     const media = getMediaInfo(reply);
     if (!media) {
-      return ctx.reply('❌ Please reply to an audio, video or document file.');
+      return ctx.reply('❌ Reply to an audio, video, voice or document file.');
     }
-    
-    const stamp = Date.now();
+
+    const stamp     = Date.now();
     const inputPath = path.join(CACHE_DIR, `in_${stamp}`);
-    
+    let statusMsgId = null;
+
     try {
-      await ctx.reply('⬇️ Downloading media…');
+      // First status message (will be edited later)
+      const status = await ctx.reply('⬇️ Downloading media…');
+      statusMsgId = status.message_id;
+
       await ctx.downloadFile(media.fileId, inputPath);
-      
+
       const probe = await ffprobe(inputPath);
-      const kind = detectKind(probe);
-      
-      if (!kind) {
+      const info  = analyse(probe);
+
+      if (!info.hasAudio && !info.hasVideo) {
         safeUnlink(inputPath);
-        return ctx.reply('❌ Unsupported file (no audio/video stream found).');
+        return ctx.editText(statusMsgId, '❌ Unsupported file – no audio or video stream.');
       }
-      
-      // Keep the file for the callback (rename so we know the stamp)
+
+      // Store for the callback
       const storedPath = path.join(CACHE_DIR, `stored_${stamp}`);
       fs.renameSync(inputPath, storedPath);
-      
-      // Build buttons according to type
+
+      // Build only relevant buttons
       const buttons = [];
-      if (kind === 'audio') {
+
+      if (info.hasAudio && !info.hasVideo) {
+        // Pure audio → can become MP4
         buttons.push([
           { text: '🎬 Convert to MP4', callback_data: `link:to_mp4:${stamp}` },
         ]);
-      } else if (kind === 'video') {
+      }
+
+      if (info.hasVideo || (info.hasAudio && info.hasVideo)) {
+        // Has video (or both) → extract to MP3
         buttons.push([
           { text: '🎵 Convert to MP3', callback_data: `link:to_mp3:${stamp}` },
         ]);
       }
-      
-      // Also offer both if the file has both streams (rare but possible)
-      if (kind === 'both') {
-        buttons.push(
-          [{ text: '🎵 Convert to MP3', callback_data: `link:to_mp3:${stamp}` }],
-          [{ text: '🎬 Convert to MP4', callback_data: `link:to_mp4:${stamp}` }],
-        );
-      }
-      
-      await ctx.reply(
-        `✅ Detected: <b>${kind.toUpperCase()}</b>\nChoose conversion:`,
+
+      // Always add Cancel
+      buttons.push([
+        { text: '❌ Cancel', callback_data: `link:cancel:${stamp}` },
+      ]);
+
+      const typeLabel = info.hasVideo
+        ? (info.hasAudio ? 'Video + Audio' : 'Video')
+        : 'Audio';
+
+      await ctx.editText(
+        statusMsgId,
+        `✅ Detected: <b>${typeLabel}</b>\n\nChoose an option:`,
         {
           parse_mode: 'HTML',
           reply_markup: { inline_keyboard: buttons },
@@ -94,56 +104,70 @@ async function execute(ctx) {
     } catch (err) {
       console.error('[link]', err);
       safeUnlink(inputPath);
-      await ctx.reply(`❌ Failed: ${err.message || err}`);
+      if (statusMsgId) {
+        await ctx.editText(statusMsgId, `❌ Failed: ${err.message || err}`);
+      } else {
+        await ctx.reply(`❌ Failed: ${err.message || err}`);
+      }
     }
     return;
   }
-  
-  // ── Case 2: classic URL usage ─────────────────────────────────────────────
+
+  // ── Case 2: URL ───────────────────────────────────────────────────────────
   const url = args[0];
   if (!url || !/^https?:\/\//i.test(url)) {
     return ctx.reply(
       'Usage:\n' +
-      '• Reply to a media file with `/link`\n' +
-      '• Or: `/link <direct-url>`'
+      '• Reply to a media file with <code>/link</code>\n' +
+      '• Or: <code>/link &lt;direct-url&gt;</code>',
+      { parse_mode: 'HTML' }
     );
   }
-  
-  // URL flow (same as before – auto convert)
-  const stamp = Date.now();
-  const inputPath = path.join(CACHE_DIR, `in_${stamp}`);
+
+  const stamp      = Date.now();
+  const inputPath  = path.join(CACHE_DIR, `in_${stamp}`);
   const outputBase = path.join(CACHE_DIR, `out_${stamp}`);
-  
+  let statusMsgId  = null;
+
   try {
-    await ctx.reply('⬇️ Downloading…');
+    const status = await ctx.reply('⬇️ Downloading…');
+    statusMsgId = status.message_id;
+
     await downloadUrl(url, inputPath);
-    
+
     const probe = await ffprobe(inputPath);
-    const kind = detectKind(probe);
-    
+    const info  = analyse(probe);
+
     let finalOutput, sendType, caption;
-    
-    if (kind === 'audio') {
+
+    if (info.hasAudio && !info.hasVideo) {
+      // Audio → MP4
+      await ctx.editText(statusMsgId, '🔄 Converting to MP4…');
       finalOutput = outputBase + '.mp4';
-      await ctx.reply('🔄 Converting MP3 → MP4…');
-      await convertMp3ToMp4(inputPath, finalOutput, probe);
+      await convertToMp4(inputPath, finalOutput, probe);
       sendType = 'video';
-      caption = '✅ Converted to MP4';
-    } else if (kind === 'video' || kind === 'both') {
+      caption  = '✅ Converted to MP4';
+    } else if (info.hasVideo) {
+      // Video → MP3
+      await ctx.editText(statusMsgId, '🔄 Converting to MP3…');
       finalOutput = outputBase + '.mp3';
-      await ctx.reply('🔄 Converting MP4 → MP3…');
-      await convertMp4ToMp3(inputPath, finalOutput);
+      await convertToMp3(inputPath, finalOutput);
       sendType = 'audio';
-      caption = '✅ Converted to MP3';
+      caption  = '✅ Converted to MP3';
     } else {
       throw new Error('Unsupported file');
     }
-    
+
     await ctx.chatAction(sendType === 'video' ? 'upload_video' : 'upload_audio');
     await ctx.sendMediaFile(finalOutput, sendType, { caption });
+    await ctx.editText(statusMsgId, caption);
   } catch (err) {
     console.error('[link]', err);
-    await ctx.reply(`❌ Failed: ${err.message || err}`);
+    if (statusMsgId) {
+      await ctx.editText(statusMsgId, `❌ Failed: ${err.message || err}`);
+    } else {
+      await ctx.reply(`❌ Failed: ${err.message || err}`);
+    }
   } finally {
     safeUnlink(inputPath);
     safeUnlink(outputBase + '.mp3');
@@ -151,54 +175,63 @@ async function execute(ctx) {
   }
 }
 
-// ── Callback handler (button presses) ────────────────────────────────────────
+// ── Callback handler ─────────────────────────────────────────────────────────
 async function onCallback(ctx, cq) {
-  const parts = cq.data.split(':'); // link : action : stamp
+  const parts  = cq.data.split(':'); // link : action : stamp
   const action = parts[1];
-  const stamp = parts[2];
-  
+  const stamp  = parts[2];
+
   await ctx.answerCallback(cq.id);
-  
-  if (!stamp || !['to_mp3', 'to_mp4'].includes(action)) {
-    return ctx.editText(ctx.messageId, '❌ Invalid action.');
+
+  if (!stamp) {
+    return ctx.editText(ctx.messageId, '❌ Invalid request.');
   }
-  
+
   const storedPath = path.join(CACHE_DIR, `stored_${stamp}`);
-  if (!fs.existsSync(storedPath)) {
-    return ctx.editText(ctx.messageId, '❌ File expired or already processed. Please try again.');
-  }
-  
   const outputBase = path.join(CACHE_DIR, `out_${stamp}`);
-  let finalOutput, sendType, caption;
-  
+
+  // ── Cancel ────────────────────────────────────────────────────────────────
+  if (action === 'cancel') {
+    safeUnlink(storedPath);
+    return ctx.editText(ctx.messageId, '❌ Cancelled.');
+  }
+
+  if (!['to_mp3', 'to_mp4'].includes(action)) {
+    return ctx.editText(ctx.messageId, '❌ Unknown action.');
+  }
+
+  if (!fs.existsSync(storedPath)) {
+    return ctx.editText(ctx.messageId, '❌ File expired. Please run the command again.');
+  }
+
   try {
     await ctx.editText(ctx.messageId, '🔄 Converting… please wait');
-    
+
     const probe = await ffprobe(storedPath);
-    
+    let finalOutput, sendType, caption;
+
     if (action === 'to_mp4') {
       finalOutput = outputBase + '.mp4';
-      await convertMp3ToMp4(storedPath, finalOutput, probe);
+      await convertToMp4(storedPath, finalOutput, probe);
       sendType = 'video';
-      caption = '✅ Converted to MP4';
+      caption  = '✅ Converted to MP4';
     } else {
       finalOutput = outputBase + '.mp3';
-      await convertMp4ToMp3(storedPath, finalOutput);
+      await convertToMp3(storedPath, finalOutput);
       sendType = 'audio';
-      caption = '✅ Converted to MP3';
+      caption  = '✅ Converted to MP3';
     }
-    
-    // Send the result as a new message
+
+    // Send the finished file
     await ctx.chatAction(sendType === 'video' ? 'upload_video' : 'upload_audio');
     await ctx.sendMediaFile(finalOutput, sendType, { caption });
-    
-    // Update the button message
+
+    // Edit the original status message
     await ctx.editText(ctx.messageId, caption);
   } catch (err) {
     console.error('[link callback]', err);
     await ctx.editText(ctx.messageId, `❌ Conversion failed: ${err.message || err}`);
   } finally {
-    // Cleanup
     safeUnlink(storedPath);
     safeUnlink(outputBase + '.mp3');
     safeUnlink(outputBase + '.mp4');
@@ -208,22 +241,22 @@ async function onCallback(ctx, cq) {
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function getMediaInfo(msg) {
-  if (msg.audio) return { fileId: msg.audio.file_id, type: 'audio' };
-  if (msg.voice) return { fileId: msg.voice.file_id, type: 'voice' };
-  if (msg.video) return { fileId: msg.video.file_id, type: 'video' };
-  if (msg.video_note) return { fileId: msg.video_note.file_id, type: 'video_note' };
-  if (msg.document) return { fileId: msg.document.file_id, type: 'document' };
-  if (msg.animation) return { fileId: msg.animation.file_id, type: 'animation' };
+  if (msg.audio)      return { fileId: msg.audio.file_id };
+  if (msg.voice)      return { fileId: msg.voice.file_id };
+  if (msg.video)      return { fileId: msg.video.file_id };
+  if (msg.video_note) return { fileId: msg.video_note.file_id };
+  if (msg.animation)  return { fileId: msg.animation.file_id };
+  if (msg.document)   return { fileId: msg.document.file_id };
   return null;
 }
 
-function detectKind(probe) {
-  const hasAudio = probe.streams?.some(s => s.codec_type === 'audio');
-  const hasVideo = probe.streams?.some(s => s.codec_type === 'video');
-  if (hasAudio && hasVideo) return 'both';
-  if (hasAudio) return 'audio';
-  if (hasVideo) return 'video';
-  return null;
+function analyse(probe) {
+  const streams = probe.streams || [];
+  return {
+    hasAudio: streams.some(s => s.codec_type === 'audio'),
+    hasVideo: streams.some(s => s.codec_type === 'video'),
+    duration: parseFloat(probe.format?.duration) || 30,
+  };
 }
 
 async function downloadUrl(url, dest) {
@@ -244,7 +277,7 @@ async function ffprobe(file) {
   return JSON.parse(stdout);
 }
 
-async function convertMp3ToMp4(input, output, probe) {
+async function convertToMp4(input, output, probe) {
   const duration = parseFloat(probe.format?.duration) || 30;
   await execFileAsync('ffmpeg', [
     '-y',
@@ -258,17 +291,19 @@ async function convertMp3ToMp4(input, output, probe) {
     '-pix_fmt', 'yuv420p',
     '-shortest',
     '-movflags', '+faststart',
+    '-threads', '4',
     output,
   ]);
 }
 
-async function convertMp4ToMp3(input, output) {
+async function convertToMp3(input, output) {
   await execFileAsync('ffmpeg', [
     '-y',
     '-i', input,
     '-vn',
     '-c:a', 'libmp3lame',
     '-b:a', '192k',
+    '-threads', '4',
     output,
   ]);
 }
