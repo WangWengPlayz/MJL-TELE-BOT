@@ -323,7 +323,7 @@ async function handleMessage(token, msg) {
   const chatId = msg.chat.id;
   const text = (msg.text || '').trim();
   const prefix = config.prefix || '/';
-  
+
   if (!text.startsWith(prefix)) return;
 
   const ctx = buildCtx(token, chatId);
@@ -459,8 +459,22 @@ async function poll(token) {
 
       for (const update of updates) {
         offset = update.update_id + 1;
-        if (update.message) await handleMessage(token, update.message);
-        else if (update.callback_query) await handleCallbackQuery(token, update.callback_query);
+
+        // Fire-and-forget: do NOT await each update's handler here.
+        // Awaiting would block getUpdates() from being called again until
+        // the current update (e.g. a multi-minute ffmpeg conversion in
+        // link.js) finishes, causing any callback queries that arrive in
+        // the meantime to sit unprocessed until they expire on Telegram's
+        // side ("query is too old").
+        if (update.message) {
+          handleMessage(token, update.message).catch((err) => {
+            console.error('Unhandled error in handleMessage:', err.message);
+          });
+        } else if (update.callback_query) {
+          handleCallbackQuery(token, update.callback_query).catch((err) => {
+            console.error('Unhandled error in handleCallbackQuery:', err.message);
+          });
+        }
       }
     } catch (err) {
       // 409 Conflict = another instance (e.g. Render deployment) is already polling.
@@ -525,7 +539,7 @@ async function startBot(token) {
       `📋 Commands loaded: <b>${commands.size}</b>\n` +
       `🔧 Prefix: <code>${config.prefix}</code>\n` +
       `🌐 Mode: <b>polling</b>`;
-    
+
     try {
       await sendMessage(token, config.adminId, adminMsg, { parse_mode: 'HTML' });
       console.log(`[bot] Admin notification sent to ${config.adminId}`);
