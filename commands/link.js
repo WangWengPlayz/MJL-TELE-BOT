@@ -1,8 +1,3 @@
-// ============================================================
-//  /link — detect a replied file's type and convert it
-//  (debug mode: verbose errors/warnings sent to chat)
-// ============================================================
-
 const { exec } = require('child_process');
 const util = require('util');
 const path = require('path');
@@ -10,13 +5,11 @@ const fs = require('fs');
 const os = require('os');
 const execAsync = util.promisify(exec);
 
-// Shared cache module (per your note) instead of a local Map.
-const cache = require('../commands/cache');
+const cache = require('cache');
 
 const CACHE_PREFIX = 'link:';
-const CACHE_TTL_MS = 5 * 60 * 1000; // 5 min
+const CACHE_TTL_MS = 5 * 60 * 1000;
 
-// Toggle this (or wire it to a config/env var) to turn debug output on/off.
 let DEBUG = false;
 
 module.exports = {
@@ -33,11 +26,9 @@ module.exports = {
   onCallback,
 };
 
-// ── Main handler ─────────────────────────────────────────────────────────
 async function execute(ctx) {
   const { args, raw: msg } = ctx;
 
-  // ── /link debug on|off ────────────────────────────────────
   if (args[0] === 'debug') {
     DEBUG = args[1] === 'on';
     await ctx.reply(`🐞 Debug mode ${DEBUG ? 'enabled ✅' : 'disabled ❌'}`);
@@ -104,7 +95,6 @@ async function execute(ctx) {
   });
 }
 
-// ── Callback handler ────────────────────────────────────────────────────
 async function onCallback(ctx, cq) {
   const [, cacheId, format] = cq.data.split(':');
   const entry = await safe(ctx, () => cache.get(CACHE_PREFIX + cacheId), 'cache.get failed in onCallback');
@@ -138,7 +128,7 @@ async function onCallback(ctx, cq) {
     const { stdout, stderr } = await execAsync(ffmpegCmd);
 
     if (DEBUG && stderr) {
-      await sendChunked(ctx, `🐞 [debug] ffmpeg stderr (usually just progress/log, not fatal):\n<code>${escapeHtml(stderr)}</code>`);
+      await sendChunked(ctx, `🐞 [debug] ffmpeg stderr:\n<code>${escapeHtml(stderr)}</code>`);
     }
 
     const sendType = guessSendType(format);
@@ -166,9 +156,6 @@ async function onCallback(ctx, cq) {
   }
 }
 
-// ── Debug helpers ────────────────────────────────────────────────────────
-
-// Wrap a step; on failure, log to chat if DEBUG, otherwise swallow/log to console.
 async function safe(ctx, fn, label = '') {
   try {
     return await fn();
@@ -178,13 +165,12 @@ async function safe(ctx, fn, label = '') {
       await ctx.reply(
         `🐞 <b>[debug] ${escapeHtml(label || 'Error')}</b>\n<code>${escapeHtml(err.message)}</code>`,
         { parse_mode: 'HTML' }
-      ).catch(() => {}); // never let debug logging itself crash the handler
+      ).catch(() => {});
     }
     return null;
   }
 }
 
-// Log a non-fatal warning — only visible in chat when DEBUG is on.
 async function warn(ctx, message, meta) {
   console.warn(`[link] WARN: ${message}`, meta || '');
   if (DEBUG) {
@@ -193,14 +179,12 @@ async function warn(ctx, message, meta) {
   }
 }
 
-// Telegram messages cap at 4096 chars — split long debug dumps.
 async function sendChunked(ctx, text, limit = 3500) {
   for (let i = 0; i < text.length; i += limit) {
     await ctx.reply(text.slice(i, i + limit), { parse_mode: 'HTML' }).catch(() => {});
   }
 }
 
-// ── Helper: walk the replied message and find the file ────────────────────
 function detectFileType(msg) {
   if (msg.photo && msg.photo.length) {
     const largest = msg.photo[msg.photo.length - 1];
@@ -235,7 +219,6 @@ function detectFileType(msg) {
   return null;
 }
 
-// ── Helper: what conversions to offer per detected kind ────────────────────
 function getConversionOptions(kind) {
   switch (kind) {
     case 'photo':     return [
