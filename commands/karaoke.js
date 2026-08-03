@@ -1,25 +1,33 @@
 // ============================================================
-//  COMMAND  —  karaoke  v1.0
+//  COMMAND  —  karaoke  v2.0
 //  /karaoke <song name or artist - title>
 //
-//  1. Searches lrclib.net for lyrics (open-source, no API key)
-//  2. Fetches the karaoke/instrumental MP3 via yt-dlp-stream API
-//  3. Sends lyrics first, then uploads the audio
+//  Flow:
+//   1. Fetch ytdl media info (query + "karaoke") → get the real title
+//   2. Clean that title, use it to search lyrics across 3 sources:
+//        lrclib.net  →  lyrics.ovh  →  lrclib fallback (original query)
+//   3. Send lyrics first, then download + upload the MP3
+//
+//  All lyrics sources are open-source / no API key required.
 // ============================================================
 
 const fs     = require('fs');
 const path   = require('path');
 const crypto = require('crypto');
 
-const CACHE_DIR    = path.join(__dirname, 'cache');
-const LYRICS_API   = 'https://lrclib.net/api/search?q=';
-const YTDL_API     = 'https://yt-dlp-stream.onrender.com/api/v2/q?=';
-const TG_MAX_BYTES = 50 * 1024 * 1024;
-const TG_MAX_TEXT  = 4000; // safe Telegram text limit (real cap 4096)
-
+const CACHE_DIR = path.join(__dirname, 'cache');
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// API endpoints
+const YTDL_API       = 'https://yt-dlp-stream.onrender.com/api/v2/q?=';
+const LRCLIB_SEARCH  = 'https://lrclib.net/api/search?q=';
+const LYRICS_OVH_SUG = 'https://api.lyrics.ovh/suggest/';
+const LYRICS_OVH_GET = 'https://api.lyrics.ovh/v1/';
+
+const TG_MAX_BYTES = 50 * 1024 * 1024;
+const TG_MAX_TEXT  = 4000; // safe cap (real Telegram limit is 4096)
+
+// ── Generic helpers ───────────────────────────────────────────────────────────
 
 function escapeHtml(str) {
   return String(str)
@@ -28,20 +36,20 @@ function escapeHtml(str) {
     .replace(/>/g, '&gt;');
 }
 
-function formatBytes(bytes) {
-  if (bytes < 1024)       return `${bytes} B`;
-  if (bytes < 1048576)    return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1048576).toFixed(2)} MB`;
+function formatBytes(b) {
+  if (b < 1024)       return `${b} B`;
+  if (b < 1048576)    return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / 1048576).toFixed(2)} MB`;
 }
 
-function formatEta(seconds) {
-  if (seconds < 60)  return `${Math.round(seconds)}s`;
-  return `${Math.floor(seconds / 60)}m ${Math.round(seconds % 60)}s`;
+function formatEta(s) {
+  if (s < 60)  return `${Math.round(s)}s`;
+  return `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`;
 }
 
-function formatSpeed(bytesPerSec) {
-  if (bytesPerSec < 1048576) return `${(bytesPerSec / 1024).toFixed(1)} KB/s`;
-  return `${(bytesPerSec / 1048576).toFixed(2)} MB/s`;
+function formatSpeed(bps) {
+  if (bps < 1048576) return `${(bps / 1024).toFixed(1)} KB/s`;
+  return `${(bps / 1048576).toFixed(2)} MB/s`;
 }
 
 function progressBar(pct, len = 14) {
@@ -57,11 +65,11 @@ function safeFilename(title) {
   return title.replace(/[/\\?%*:|"<>\r\n]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
 }
 
-function shortTitle(title, max = 40) {
+function shortTitle(title, max = 42) {
   return title.length > max ? title.slice(0, max) + '…' : title;
 }
 
-/** Retry a fetch on 5xx / network errors. */
+/** Retry a fetch on 5xx / network errors (up to `retries` attempts). */
 async function fetchWithRetry(url, opts = {}, retries = 2) {
   let lastErr;
   for (let i = 0; i < retries; i++) {
@@ -81,51 +89,143 @@ async function fetchWithRetry(url, opts = {}, retries = 2) {
   throw lastErr;
 }
 
-// ── Lyrics fetcher (lrclib.net — open source, no API key) ─────────────────────
+// ── Title cleaner ─────────────────────────────────────────────────────────────
 
 /**
- * Search lrclib.net for lyrics.
- * Returns { trackName, artistName, plainLyrics } or null.
+ * Strip YouTube-video noise from a title so lyrics APIs get a clean query.
+ * e.g. "Queen - Bohemian Rhapsody (Karaoke Version) [HD]"
+ *       → "Bohemian Rhapsody"  (with artist "Queen")
+ * Returns { cleanTitle, artist } — artist may be null.
  */
-async function fetchLyrics(query) {
-  const url = `${LYRICS_API}${encodeURIComponent(query)}`;
+function parseYtdlTitle(rawTitle) {
+  let title  = rawTitle;
+  let artist = null;
+
+  // Strip common suffix noise (case-insensitive)
+  const NOISE = [
+    /\bkaraoke\s*(version|ver\.?|mix)?\b/gi,
+    /\bno\s*vocals?\b/gi,
+    /\binstrumental\b/gi,
+    /\bofficial\s*(audio|video|lyric\s*video|music\s*video)?\b/gi,
+    /\b(lyrics?\s*video|lyric\s*video|with\s*lyrics?)\b/gi,
+    /\b(hd|hq|4k|1080p|720p)\b/gi,
+    /\bfull\s*(song|version|audio)\b/gi,
+    /\[\s*[^\]]*\]/g,   // anything inside [brackets]
+    /\(\s*\)/g,         // empty parens
+  ];
+  for (const re of NOISE) title = title.replace(re, '');
+  title = title.replace(/[|‒–—•·]+/g, '-').replace(/\s{2,}/g, ' ').trim();
+
+  // Extract "Artist - Title" or "Artist — Title"
+  const dashMatch = title.match(/^(.+?)\s*[-–—]\s*(.+)$/);
+  if (dashMatch) {
+    artist = dashMatch[1].trim();
+    title  = dashMatch[2].trim();
+  }
+
+  // Final cleanup: remove trailing punctuation / noise parens
+  title = title.replace(/\([^)]*\)\s*$/, '').replace(/\s{2,}/g, ' ').trim();
+
+  return { cleanTitle: title || rawTitle, artist };
+}
+
+// ── Lyrics sources ────────────────────────────────────────────────────────────
+
+/**
+ * Source 1 — lrclib.net (open source, no API key)
+ * Searches by arbitrary query string.
+ */
+async function fromLrclib(query) {
+  const url = `${LRCLIB_SEARCH}${encodeURIComponent(query)}`;
   const res = await fetchWithRetry(url, { signal: AbortSignal.timeout(15_000) });
-  if (!res.ok) throw new Error(`Lyrics API HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`lrclib HTTP ${res.status}`);
   const data = await res.json();
   if (!Array.isArray(data) || data.length === 0) return null;
 
-  // Prefer results that have plain lyrics
-  const withLyrics = data.filter((r) => r.plainLyrics && r.plainLyrics.trim().length > 10);
+  const withLyrics = data.filter((r) => r.plainLyrics && r.plainLyrics.trim().length > 20);
   if (withLyrics.length === 0) return null;
 
   const best = withLyrics[0];
   return {
-    trackName:  best.trackName  || 'Unknown Title',
-    artistName: best.artistName || 'Unknown Artist',
-    plainLyrics: best.plainLyrics.trim(),
+    source:     'lrclib.net',
+    trackName:  best.trackName  || query,
+    artistName: best.artistName || '',
+    lyrics:     best.plainLyrics.trim(),
   };
+}
+
+/**
+ * Source 2 — lyrics.ovh (free, no API key)
+ * Step 1: suggest endpoint → get artist + title
+ * Step 2: fetch lyrics with artist + title
+ */
+async function fromLyricsOvh(query) {
+  // Step 1: suggest
+  const sugRes = await fetchWithRetry(
+    `${LYRICS_OVH_SUG}${encodeURIComponent(query)}`,
+    { signal: AbortSignal.timeout(10_000) }
+  );
+  if (!sugRes.ok) throw new Error(`lyrics.ovh suggest HTTP ${sugRes.status}`);
+  const sugData = await sugRes.json();
+
+  const items = sugData.data;
+  if (!Array.isArray(items) || items.length === 0) return null;
+
+  const pick    = items[0];
+  const artist  = pick.artist?.name || '';
+  const title   = pick.title || query;
+
+  // Step 2: fetch
+  const getRes = await fetchWithRetry(
+    `${LYRICS_OVH_GET}${encodeURIComponent(artist)}/${encodeURIComponent(title)}`,
+    { signal: AbortSignal.timeout(10_000) }
+  );
+  if (!getRes.ok) throw new Error(`lyrics.ovh fetch HTTP ${getRes.status}`);
+  const getData = await getRes.json();
+
+  if (!getData.lyrics || getData.lyrics.trim().length < 20) return null;
+
+  return {
+    source:     'lyrics.ovh',
+    trackName:  title,
+    artistName: artist,
+    lyrics:     getData.lyrics.trim(),
+  };
+}
+
+/**
+ * Try all lyrics sources in order; return first success or null.
+ * sources: array of async () => result | null
+ */
+async function fetchLyricsWithFallback(sources) {
+  for (const sourceFn of sources) {
+    try {
+      const result = await sourceFn();
+      if (result) return result;
+    } catch (err) {
+      console.warn(`[karaoke] Lyrics source failed: ${err.message}`);
+    }
+  }
+  return null;
 }
 
 // ── ytdl media fetcher ────────────────────────────────────────────────────────
 
 /**
- * Fetch media info from yt-dlp-stream API.
- * Appends "karaoke" to the query to target karaoke versions.
+ * Fetch the karaoke track from YouTube via yt-dlp-stream API.
+ * Appends "karaoke" to force karaoke/instrumental results.
  */
 async function fetchKaraokeMedia(query) {
-  // Force karaoke search by appending the keyword
   const karaokeQuery = `${query} karaoke`;
   const url = `${YTDL_API}${encodeURIComponent(karaokeQuery)}`;
   const res = await fetchWithRetry(url, { signal: AbortSignal.timeout(60_000) });
-  if (!res.ok) throw new Error(`Media API HTTP ${res.status}. The backend may be waking up — try again.`);
+  if (!res.ok) throw new Error(`ytdl API HTTP ${res.status} — the backend may be waking up, try again.`);
   const data = await res.json();
-  if (!data.title || !data.media?.mp3) {
-    throw new Error('No MP3 found for that karaoke query.');
-  }
-  return data;
+  if (!data.title || !data.media?.mp3) throw new Error('No MP3 found for that query.');
+  return data;  // { title, duration, thumbnail, media: { mp3, mp4? } }
 }
 
-// ── MP3 downloader with progress ─────────────────────────────────────────────
+// ── MP3 downloader with progress ──────────────────────────────────────────────
 
 async function downloadMp3(url, destPath, onProgress) {
   const res = await fetchWithRetry(url, {
@@ -140,15 +240,13 @@ async function downloadMp3(url, destPath, onProgress) {
 
   if (!res.ok) throw new Error(`Download failed — HTTP ${res.status}`);
 
-  const contentType   = res.headers.get('content-type') || '';
-  const contentLength = parseInt(res.headers.get('content-length') || '0', 10);
+  const ct  = res.headers.get('content-type') || '';
+  const len = parseInt(res.headers.get('content-length') || '0', 10);
 
-  if (contentType.includes('text/html') || contentType.includes('application/json')) {
+  if (ct.includes('text/html') || ct.includes('application/json'))
     throw new Error('Server returned a webpage instead of audio. The link may have expired.');
-  }
-  if (contentLength > 0 && contentLength > TG_MAX_BYTES) {
-    throw new Error(`File too large (${formatBytes(contentLength)}) — exceeds Telegram's 50 MB limit.`);
-  }
+  if (len > 0 && len > TG_MAX_BYTES)
+    throw new Error(`File too large (${formatBytes(len)}) — Telegram limit is 50 MB.`);
   if (!res.body) throw new Error('No response body from download URL.');
 
   const reader   = res.body.getReader();
@@ -157,25 +255,18 @@ async function downloadMp3(url, destPath, onProgress) {
   let lastNotify = Date.now();
 
   while (true) {
-    try {
-      const { done, value } = await reader.read();
-      if (done) break;
-      chunks.push(value);
-      received += value.length;
-
-      if (received > TG_MAX_BYTES) {
-        reader.cancel();
-        throw new Error(`File exceeded 50 MB at ${formatBytes(received)}. Aborted.`);
-      }
-
-      const now = Date.now();
-      if (onProgress && now - lastNotify > 1200) {
-        lastNotify = now;
-        await onProgress(received, contentLength).catch(() => {});
-      }
-    } catch (err) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    chunks.push(value);
+    received += value.length;
+    if (received > TG_MAX_BYTES) {
       reader.cancel();
-      throw err;
+      throw new Error(`File exceeded 50 MB at ${formatBytes(received)}. Aborted.`);
+    }
+    const now = Date.now();
+    if (onProgress && now - lastNotify > 1200) {
+      lastNotify = now;
+      await onProgress(received, len).catch(() => {});
     }
   }
 
@@ -186,13 +277,13 @@ async function downloadMp3(url, destPath, onProgress) {
   return buffer.length;
 }
 
-// ── Lyrics chunk sender ───────────────────────────────────────────────────────
+// ── Lyrics sender (auto-splits at 4000 chars) ─────────────────────────────────
 
-/**
- * Send lyrics as one or more messages, splitting at blank lines if too long.
- */
-async function sendLyrics(ctx, trackName, artistName, lyrics) {
-  const header = `🎤 <b>${escapeHtml(trackName)}</b>\n👤 <i>${escapeHtml(artistName)}</i>\n${'─'.repeat(28)}\n\n`;
+async function sendLyrics(ctx, result) {
+  const { source, trackName, artistName, lyrics } = result;
+  const header =
+    `🎤 <b>${escapeHtml(trackName)}</b>${artistName ? `\n👤 <i>${escapeHtml(artistName)}</i>` : ''}\n` +
+    `📚 <i>Source: ${escapeHtml(source)}</i>\n${'─'.repeat(28)}\n\n`;
 
   const full = header + escapeHtml(lyrics);
 
@@ -201,43 +292,42 @@ async function sendLyrics(ctx, trackName, artistName, lyrics) {
     return;
   }
 
-  // Split into chunks on blank lines, keeping header on first chunk
+  // Split on blank lines (stanzas), flush when chunk nears limit
   const stanzas = lyrics.split(/\n{2,}/);
-  let current   = header;
+  let chunk = header;
 
   for (const stanza of stanzas) {
     const piece = escapeHtml(stanza) + '\n\n';
-    if (current.length + piece.length > TG_MAX_TEXT) {
-      await ctx.replyWithHTML(current.trimEnd());
-      current = '';
+    if (chunk.length + piece.length > TG_MAX_TEXT) {
+      await ctx.replyWithHTML(chunk.trimEnd());
+      chunk = '';
     }
-    current += piece;
+    chunk += piece;
   }
 
-  if (current.trim().length > 0) {
-    await ctx.replyWithHTML(current.trimEnd());
-  }
+  if (chunk.trim().length > 0) await ctx.replyWithHTML(chunk.trimEnd());
 }
 
-// ── Module export ─────────────────────────────────────────────────────────────
+// ── Command export ────────────────────────────────────────────────────────────
 
 module.exports = {
   name:        'karaoke',
-  version:     '1.0.0',
-  description: 'Get lyrics + karaoke MP3 for any song. No API key needed — fully open source.',
-  usage:       '/karaoke <song title or artist - title>',
+  version:     '2.0.0',
+  description: 'Lyrics + karaoke MP3 for any song. Open-source lyrics, no API keys.',
+  usage:       '/karaoke <song name>  |  /karaoke <artist - title>',
   category:    'Media',
   permission:  1,
-  cooldown:    30,  // karaoke downloads are heavy — 30s cooldown
+  cooldown:    30,
   aliases:     ['kar', 'kara'],
 
   async execute(ctx) {
     const { args, raw: msg } = ctx;
 
+    // ── Usage hint ──────────────────────────────────────────────────────────
     if (!args || args.length === 0) {
       return ctx.replyWithHTML(
         '🎤 <b>Karaoke</b>\n\n' +
-        'Sends lyrics + a karaoke MP3 for any song.\n\n' +
+        'Sends lyrics first, then a karaoke MP3.\n\n' +
         '<b>Usage:</b>\n' +
         '  <code>/karaoke &lt;song name&gt;</code>\n' +
         '  <code>/karaoke &lt;artist - title&gt;</code>\n\n' +
@@ -245,112 +335,119 @@ module.exports = {
         '  <code>/karaoke Bohemian Rhapsody</code>\n' +
         '  <code>/karaoke Queen - Bohemian Rhapsody</code>\n' +
         '  <code>/karaoke shape of you ed sheeran</code>\n\n' +
-        '🎵 Lyrics from <b>lrclib.net</b> (open source)\n' +
-        '🎬 Audio via <b>YouTube</b> karaoke search'
+        '📚 <b>Lyrics sources</b> (open-source, no API key):\n' +
+        '  • lrclib.net\n' +
+        '  • lyrics.ovh\n' +
+        '🎵 Audio: YouTube karaoke search via yt-dlp'
       );
     }
 
-    const query = args.join(' ').trim();
+    const userQuery = args.join(' ').trim();
 
     // ── Status message ──────────────────────────────────────────────────────
     const status = await ctx.replyWithHTML(
-      `🎤 <b>Karaoke:</b> <i>${escapeHtml(query)}</i>\n\n⏳ Searching for lyrics and karaoke audio…`
+      `🎤 <b>Karaoke:</b> <i>${escapeHtml(userQuery)}</i>\n\n🔍 Looking up karaoke track on YouTube…`
     );
 
-    // ── Phase 1: fetch lyrics + media info in parallel ──────────────────────
-    let lyricsResult = null;
-    let mediaData    = null;
-    let lyricsError  = null;
-    let mediaError   = null;
-
-    await ctx.editText(
-      status.message_id,
-      `🎤 <b>Karaoke:</b> <i>${escapeHtml(query)}</i>\n\n🔍 Fetching lyrics &amp; karaoke audio…`,
-      { parse_mode: 'HTML' }
-    ).catch(() => {});
-
-    [lyricsResult, mediaData] = await Promise.allSettled([
-      fetchLyrics(query),
-      fetchKaraokeMedia(query),
-    ]).then((results) => [
-      results[0].status === 'fulfilled' ? results[0].value : (() => { lyricsError = results[0].reason; return null; })(),
-      results[1].status === 'fulfilled' ? results[1].value : (() => { mediaError  = results[1].reason; return null; })(),
-    ]);
-
-    // If both failed, bail out
-    if (!lyricsResult && !mediaData) {
+    // ── Step 1: fetch media info to get the real ytdl title ─────────────────
+    let mediaData;
+    try {
       await ctx.editText(
         status.message_id,
-        `❌ <b>Nothing found</b> for: <i>${escapeHtml(query)}</i>\n\n` +
-        `Lyrics: ${escapeHtml(lyricsError?.message || 'not found')}\n` +
-        `Audio: ${escapeHtml(mediaError?.message   || 'not found')}\n\n` +
-        `<i>Try a different spelling or add the artist name.</i>`,
+        `🎤 <b>Karaoke:</b> <i>${escapeHtml(userQuery)}</i>\n\n` +
+        `🔍 <b>Step 1/3</b> — Fetching karaoke track info…`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
+
+      mediaData = await fetchKaraokeMedia(userQuery);
+    } catch (err) {
+      await ctx.editText(
+        status.message_id,
+        `❌ <b>No karaoke track found</b>\n${escapeHtml(err.message)}\n\n` +
+        `<i>Try adding the artist name, e.g. <code>/karaoke Queen Bohemian Rhapsody</code></i>`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
       return;
     }
 
-    // ── Phase 2: send lyrics ────────────────────────────────────────────────
+    const ytTitle = mediaData.title;  // real YouTube video title
+
+    // ── Step 2: use ytdl title to search lyrics across multiple sources ──────
+    const { cleanTitle, artist } = parseYtdlTitle(ytTitle);
+
+    // Build query strings for lyrics APIs
+    const titleQuery    = artist ? `${artist} ${cleanTitle}` : cleanTitle;
+    const fallbackQuery = userQuery;
+
+    await ctx.editText(
+      status.message_id,
+      `🎤 <b>Karaoke:</b> <i>${escapeHtml(userQuery)}</i>\n\n` +
+      `✅ Found: <b>${escapeHtml(shortTitle(ytTitle))}</b>\n` +
+      `📜 <b>Step 2/3</b> — Searching lyrics for: <i>${escapeHtml(cleanTitle)}</i>…`,
+      { parse_mode: 'HTML' }
+    ).catch(() => {});
+
+    const lyricsResult = await fetchLyricsWithFallback([
+      () => fromLrclib(titleQuery),           // 1st: lrclib with cleaned ytdl title
+      () => fromLyricsOvh(titleQuery),        // 2nd: lyrics.ovh with cleaned ytdl title
+      () => fromLrclib(fallbackQuery),        // 3rd: lrclib with original user query
+      () => fromLyricsOvh(fallbackQuery),     // 4th: lyrics.ovh with original user query
+      () => fromLrclib(cleanTitle),           // 5th: lrclib with just the clean title alone
+    ]);
+
+    // ── Step 3a: send lyrics ─────────────────────────────────────────────────
     if (lyricsResult) {
       await ctx.editText(
         status.message_id,
-        `🎤 <b>Karaoke:</b> <i>${escapeHtml(query)}</i>\n\n📜 Sending lyrics…`,
+        `🎤 <b>Karaoke:</b> <i>${escapeHtml(userQuery)}</i>\n\n` +
+        `✅ Found: <b>${escapeHtml(shortTitle(ytTitle))}</b>\n` +
+        `📜 <b>Step 2/3</b> — Sending lyrics…`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
 
-      await sendLyrics(ctx, lyricsResult.trackName, lyricsResult.artistName, lyricsResult.plainLyrics);
+      await sendLyrics(ctx, lyricsResult);
     } else {
-      // Lyrics failed but audio found — mention it
       await ctx.replyWithHTML(
-        `⚠️ <b>Lyrics not found</b> for <i>${escapeHtml(query)}</i>\n` +
-        `<i>${escapeHtml(lyricsError?.message || 'No lyrics available')}</i>\n\n` +
+        `⚠️ <b>Lyrics not found</b> for <i>${escapeHtml(cleanTitle)}</i>\n` +
+        `<i>Checked: lrclib.net, lyrics.ovh (4 attempts)</i>\n\n` +
         `Sending karaoke audio anyway…`
       );
     }
 
-    // ── Phase 3: download and send karaoke MP3 ──────────────────────────────
-    if (!mediaData) {
-      await ctx.editText(
-        status.message_id,
-        `⚠️ <b>Karaoke audio not found</b>\n${escapeHtml(mediaError?.message || 'No MP3 available')}\n\n<i>Lyrics were sent above.</i>`,
-        { parse_mode: 'HTML' }
-      ).catch(() => {});
-      return;
-    }
-
+    // ── Step 3b: download & upload the karaoke MP3 ──────────────────────────
     const mp3Url      = mediaData.media.mp3;
-    const titleShort  = shortTitle(mediaData.title);
+    const titleShort_ = shortTitle(ytTitle);
     const requestId   = crypto.randomBytes(6).toString('hex');
     const tmpPath     = path.join(CACHE_DIR, `kar_${requestId}.mp3`);
-    const renamedPath = path.join(CACHE_DIR, `${safeFilename(mediaData.title)}.mp3`);
+    const renamedPath = path.join(CACHE_DIR, `${safeFilename(ytTitle)}.mp3`);
 
     try {
-      // ── Download stage ─────────────────────────────────────────────────────
       const dlStart = Date.now();
-      let lastEditTime = 0;
+      let lastEditMs = 0;
+
+      await ctx.editText(
+        status.message_id,
+        `⬇️ <b>Step 3/3</b> — Downloading karaoke MP3…\n\n🎤 <b>${escapeHtml(titleShort_)}</b>`,
+        { parse_mode: 'HTML' }
+      ).catch(() => {});
 
       await downloadMp3(mp3Url, tmpPath, async (received, total) => {
-        const elapsed    = Math.max(0.1, (Date.now() - dlStart) / 1000);
-        const speed      = received / elapsed;
-        const pct        = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;
-        const eta        = (total > received && speed > 0) ? (total - received) / speed : null;
-        const bar        = progressBar(pct);
-        const pctLabel   = pct !== null ? ` ${pct}%` : '';
-        const sizeLabel  = total > 0
-          ? `${formatBytes(received)} / ${formatBytes(total)}`
-          : `${formatBytes(received)} received`;
-        const speedLabel = speed > 100 ? formatSpeed(speed) : '…';
-        const etaLabel   = eta !== null ? `  ⏱ ~${formatEta(eta)}` : '';
+        const elapsed = Math.max(0.1, (Date.now() - dlStart) / 1000);
+        const speed   = received / elapsed;
+        const pct     = total > 0 ? Math.min(100, Math.round((received / total) * 100)) : null;
+        const eta     = (total > received && speed > 0) ? (total - received) / speed : null;
 
         const text =
-          `⬇️ <b>Downloading karaoke…</b>\n\n` +
-          `🎤 <b>${escapeHtml(titleShort)}</b>\n\n` +
-          `<code>${bar}</code>${pctLabel}\n` +
-          `${sizeLabel}  •  ${speedLabel}${etaLabel}`;
+          `⬇️ <b>Step 3/3</b> — Downloading karaoke MP3…\n\n` +
+          `🎤 <b>${escapeHtml(titleShort_)}</b>\n\n` +
+          `<code>${progressBar(pct)}</code>${pct !== null ? ` ${pct}%` : ''}\n` +
+          `${total > 0 ? `${formatBytes(received)} / ${formatBytes(total)}` : `${formatBytes(received)} received`}` +
+          `  •  ${speed > 100 ? formatSpeed(speed) : '…'}` +
+          `${eta !== null ? `  ⏱ ~${formatEta(eta)}` : ''}`;
 
         const now = Date.now();
-        if (now - lastEditTime > 1500) {
-          lastEditTime = now;
+        if (now - lastEditMs > 1500) {
+          lastEditMs = now;
           await ctx.editText(status.message_id, text, { parse_mode: 'HTML' }).catch(() => {});
         }
       });
@@ -358,21 +455,21 @@ module.exports = {
       const finalSize = formatBytes(fs.statSync(tmpPath).size);
       const dlSecs    = ((Date.now() - dlStart) / 1000).toFixed(1);
 
-      // ── Upload stage ───────────────────────────────────────────────────────
       await ctx.editText(
         status.message_id,
-        `📤 <b>Uploading karaoke to Telegram…</b>\n\n` +
-        `🎤 <b>${escapeHtml(titleShort)}</b>\n` +
-        `📦 ${finalSize}  •  ⏱ Downloaded in ${dlSecs}s`,
+        `📤 Uploading to Telegram…\n\n🎤 <b>${escapeHtml(titleShort_)}</b>\n📦 ${finalSize}  •  ⬇️ ${dlSecs}s`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
 
       fs.renameSync(tmpPath, renamedPath);
 
-      const caption = `🎤 <b>${escapeHtml(mediaData.title)}</b>\n🎵 Karaoke MP3  •  📦 ${finalSize}\n🤖 MJL Bot`;
-
       await Promise.race([
-        ctx.sendMediaFile(renamedPath, 'audio', { caption, parse_mode: 'HTML' }),
+        ctx.sendMediaFile(renamedPath, 'audio', {
+          caption:     `🎤 <b>${escapeHtml(ytTitle)}</b>\n🎵 Karaoke MP3  •  📦 ${finalSize}\n🤖 MJL Bot`,
+          parse_mode:  'HTML',
+          title:       ytTitle,
+          performer:   artist || undefined,
+        }),
         new Promise((_, reject) =>
           setTimeout(() => reject(new Error('Upload timed out after 5 minutes')), 300_000)
         ),
@@ -380,15 +477,16 @@ module.exports = {
 
       await ctx.editText(
         status.message_id,
-        `✅ <b>Karaoke ready!</b>  🎤 ${escapeHtml(titleShort)}\n📦 ${finalSize}  •  ⏱ ${dlSecs}s`,
+        `✅ <b>Done!</b>  🎤 ${escapeHtml(titleShort_)}\n📦 ${finalSize}  •  ⏱ ${dlSecs}s`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
 
     } catch (err) {
-      console.error('[karaoke] Error:', err.message);
+      console.error('[karaoke] Audio error:', err.message);
       await ctx.editText(
         status.message_id,
-        `❌ <b>Audio download failed</b>\n${escapeHtml(err.message)}\n\n<i>Lyrics were sent above. Try again or use a different song name.</i>`,
+        `❌ <b>Audio download failed</b>\n${escapeHtml(err.message)}\n\n` +
+        `<i>${lyricsResult ? 'Lyrics were sent above.' : ''} Try again or rephrase the song name.</i>`,
         { parse_mode: 'HTML' }
       ).catch(() => {});
     } finally {
