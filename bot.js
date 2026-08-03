@@ -6,13 +6,16 @@ const FILE_BASE = (token) => `https://api.telegram.org/file/bot${token}`;
 const POLL_TIMEOUT = 30;
 const MAX_BACKOFF = 30000;
 const COMMANDS_DIR = path.join(__dirname, 'commands');
-const CONFIG_FILE = path.join(__dirname, 'config.json');
+const EVENTS_DIR   = path.join(__dirname, 'commands', 'events');
+const CONFIG_FILE  = path.join(__dirname, 'config.json');
 
 let offset = 0;
 let running = true;
 let backoff = 1000;
 const commands = new Map();
+const events   = [];
 let commandsLoaded = false;
+let eventsLoaded   = false;
 let config = null;
 
 // ---- Load config ----
@@ -54,6 +57,12 @@ function loadCommands() {
       delete require.cache[require.resolve(fullPath)];
       const cmd = require(fullPath);
 
+      // Skip explicitly disabled commands (e.g. template files)
+      if (cmd.disabled === true) {
+        console.log(`Skipping disabled command file: ${file}`);
+        continue;
+      }
+
       if (!cmd.name || typeof cmd.execute !== 'function') {
         console.warn(`Skipping ${file}: missing "name" or "execute()"`);
         continue;
@@ -76,6 +85,32 @@ function loadCommands() {
       console.log(`Loaded command: /${entry.name} (v${entry.version})`);
     } catch (err) {
       console.error(`Failed to load ${file}:`, err.message);
+    }
+  }
+}
+
+// ---- Event loader ----
+function loadEvents() {
+  events.length = 0;
+  if (!fs.existsSync(EVENTS_DIR)) return;
+
+  const files = fs.readdirSync(EVENTS_DIR).filter((f) => f.endsWith('.js'));
+
+  for (const file of files) {
+    const fullPath = path.join(EVENTS_DIR, file);
+    try {
+      delete require.cache[require.resolve(fullPath)];
+      const ev = require(fullPath);
+
+      if (!ev.name || typeof ev.execute !== 'function') {
+        console.warn(`[events] Skipping ${file}: missing "name" or "execute()"`);
+        continue;
+      }
+
+      events.push(ev);
+      console.log(`[events] Loaded event: ${ev.name}`);
+    } catch (err) {
+      console.error(`[events] Failed to load ${file}:`, err.message);
     }
   }
 }
@@ -324,6 +359,13 @@ async function handleMessage(token, msg) {
   const text = (msg.text || '').trim();
   const prefix = config.prefix || '/';
 
+  // Fire all event handlers for every incoming message (regardless of prefix)
+  for (const ev of events) {
+    ev.execute(buildCtx(token, chatId), msg).catch((err) => {
+      console.error(`[event:${ev.name}] Error:`, err.message);
+    });
+  }
+
   if (!text.startsWith(prefix)) return;
 
   const ctx = buildCtx(token, chatId);
@@ -514,10 +556,18 @@ function ensureCommandsLoaded() {
   }
 }
 
+function ensureEventsLoaded() {
+  if (!eventsLoaded) {
+    loadEvents();
+    eventsLoaded = true;
+  }
+}
+
 async function startBot(token) {
   setupShutdown();
   loadConfig();
   ensureCommandsLoaded();
+  ensureEventsLoaded();
 
   // Clear any registered webhook before polling.
   // Telegram rejects getUpdates with a conflict error if a webhook is active.
@@ -528,7 +578,7 @@ async function startBot(token) {
     console.warn('[bot] Could not clear webhook (continuing anyway):', err.message);
   }
 
-  console.log(`[bot] Polling started with ${commands.size} command(s) loaded.`);
+  console.log(`[bot] Polling started with ${commands.size} command(s) and ${events.length} event(s) loaded.`);
   console.log(`[bot] Using prefix: "${config.prefix}"`);
 
   // Notify admin that bot is online
@@ -554,6 +604,7 @@ async function startBot(token) {
 // Single-update handler for serverless/webhook environments.
 async function handleUpdate(token, update) {
   ensureCommandsLoaded();
+  ensureEventsLoaded();
   if (!config) loadConfig();
   if (update.message) await handleMessage(token, update.message);
   else if (update.callback_query) await handleCallbackQuery(token, update.callback_query);

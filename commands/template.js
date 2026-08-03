@@ -6,6 +6,10 @@
 
 module.exports = {
 
+  // Set to true so the command loader skips this file.
+  // Remove or set to false when turning this into a real command.
+  disabled: true,
+
   // ── Required ─────────────────────────────────────────────
   name:    'example',           // /example  (lowercase, no slash)
   execute,                      // main handler — always required

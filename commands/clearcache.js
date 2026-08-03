@@ -43,7 +43,7 @@ async function execute(ctx) {
       deleted++;
     }
 
-    await ctx.reply(`🧹 Cache cleared!\nDeleted <b>\( {deleted}</b> item \){deleted === 1 ? '' : 's'}.`, {
+    await ctx.reply(`🧹 Cache cleared!\nDeleted <b>${deleted}</b> item${deleted === 1 ? '' : 's'}.`, {
       parse_mode: 'HTML',
     });
   } catch (err) {
