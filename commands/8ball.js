@@ -42,6 +42,7 @@ module.exports = {
   description: 'Ask the magic 8-ball a yes/no question.',
   usage:       '/8ball [question]',
   category:    'Fun',
+  permission:  1,
   aliases:     ['ask', 'eightball'],
 
   async execute(ctx) {

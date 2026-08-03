@@ -20,6 +20,7 @@ module.exports = {
   description: 'Play Rock, Paper, Scissors against the bot.',
   usage:       '/rps [rock | paper | scissors]',
   category:    'Fun',
+  permission:  1,
   aliases:     ['rockpaperscissors'],
 
   async execute(ctx) {

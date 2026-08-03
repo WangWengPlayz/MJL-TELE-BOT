@@ -4,6 +4,7 @@ module.exports = {
   description: 'Check if the bot is responsive and measure round-trip latency.',
   usage:       '/ping',
   category:    'Utility',
+  permission:  1,
   aliases:     [],
 
   async execute(ctx) {

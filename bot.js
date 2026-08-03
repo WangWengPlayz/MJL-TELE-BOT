@@ -74,6 +74,8 @@ function loadCommands() {
         version: cmd.version || '1.0.0',
         usage: cmd.usage || `/${cmd.name}`,
         aliases: cmd.aliases || [],
+        category: cmd.category || 'General',
+        permission: cmd.permission || 1,   // 1 = member, 2 = admin only
         callbackPrefix: cmd.callbackPrefix || null,
         execute: cmd.execute,
         onCallback: typeof cmd.onCallback === 'function' ? cmd.onCallback : null,
@@ -396,6 +398,14 @@ async function handleMessage(token, msg) {
     ).catch(() => {});
   }
 
+  // Permission check
+  if (handler.permission === 2) {
+    const callerId = msg.from?.id;
+    if (!config.adminId || Number(callerId) !== Number(config.adminId)) {
+      return ctx.replyWithHTML('🔒 <b>Admin only.</b> You don\'t have permission to use this command.').catch(() => {});
+    }
+  }
+
   try {
     await handler.execute(ctx);
   } catch (err) {
@@ -429,6 +439,7 @@ function buildCtx(token, chatId) {
   return {
     chatId,
     commands,
+    config,
 
     // ---- Send ----
     reply:             (text, extra)              => sendMessage(token, chatId, text, extra),

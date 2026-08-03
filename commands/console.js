@@ -10,11 +10,12 @@ module.exports = {
   execute,
   
   // ── Metadata (shown in /help) ─────────────────────────────
-  version: '1.0.0',
-  description: 'Shows a log message in chat.',
-  usage: '/c [optional-arg]',
-  category: 'General',
-  aliases: [],
+  version:     '1.0.0',
+  description: 'Logs a debug message server-side and echoes it in chat.',
+  usage:       '/c [message]',
+  category:    'Admin',
+  permission:  2,
+  aliases:     [],
   
 };
 

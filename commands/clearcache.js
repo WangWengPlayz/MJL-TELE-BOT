@@ -14,9 +14,10 @@ module.exports = {
   execute,
 
   version:     '1.0.0',
-  description: 'Clear all files and folders inside the cache directory',
+  description: 'Clear all files and folders inside the cache directory.',
   usage:       '/clearcache',
   category:    'Admin',
+  permission:  2,
   aliases:     ['cl'],
 };
 

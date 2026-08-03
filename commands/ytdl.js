@@ -198,6 +198,8 @@ module.exports = {
   version:        '3.1.0',
   description:    'Download YouTube videos or audio. Supports direct URLs and keyword search.',
   usage:          '/ytdl <url or title>  |  /ytdl -s <search query>',
+  category:       'Media',
+  permission:     1,
   aliases:        ['yt', 'youtube'],
   callbackPrefix: 'ytdl:',
 

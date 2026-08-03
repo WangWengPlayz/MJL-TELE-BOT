@@ -20,6 +20,7 @@ module.exports = {
   description: 'Convert audio ↔ video (reply to file or give URL)',
   usage:       '/link  (reply to media)   or   /link <url>',
   category:    'Media',
+  permission:  1,
   aliases:     ['convert', 'cv'],
 
   callbackPrefix: 'link:',

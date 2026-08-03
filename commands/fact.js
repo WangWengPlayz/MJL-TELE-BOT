@@ -75,6 +75,7 @@ module.exports = {
   description: 'Get a random fun fact. Categories: science, history, animals, space, tech.',
   usage:       '/fact [science | history | animals | space | tech]',
   category:    'Fun',
+  permission:  1,
   aliases:     ['trivia', 'funfact'],
 
   async execute(ctx) {

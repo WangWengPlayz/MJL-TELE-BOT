@@ -3,6 +3,8 @@ module.exports = {
   version:     '1.0.0',
   description: 'About this bot and its creator.',
   usage:       '/about',
+  category:    'General',
+  permission:  1,
   aliases:     ['info', 'credits'],
 
   async execute(ctx) {

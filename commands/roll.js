@@ -10,6 +10,7 @@ module.exports = {
   description: 'Roll dice. Supports RPG notation like 2d6, d20, or a plain number.',
   usage:       '/roll [NdN | max | blank for d6]',
   category:    'Fun',
+  permission:  1,
   aliases:     ['dice', 'r'],
 
   async execute(ctx) {

@@ -58,6 +58,7 @@ module.exports = {
   description: 'Get a random joke. Categories: general, programming, dad, dark.',
   usage:       '/joke [general | programming | dad | dark]',
   category:    'Fun',
+  permission:  1,
   aliases:     ['j', 'lol'],
 
   async execute(ctx) {
