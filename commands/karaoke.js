@@ -18,6 +18,9 @@ const crypto = require('crypto');
 const CACHE_DIR = path.join(__dirname, 'cache');
 if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
 
+const GeniusLyrics  = require('genius-lyrics');
+const GeniusClient  = new GeniusLyrics.Client(); // scraping mode — no API key needed
+
 const YTDL_API       = 'https://yt-dlp-stream.onrender.com/api/v2/q?=';
 const LRCLIB_SEARCH  = 'https://lrclib.net/api/search?q=';
 const LYRICS_OVH_SUG = 'https://api.lyrics.ovh/suggest/';
@@ -119,6 +122,24 @@ function parseYtdlTitle(raw) {
 
 // ── Lyrics sources ────────────────────────────────────────────────────────────
 
+/**
+ * Source 0 — Genius.com (via genius-lyrics npm, scraping mode — no API key)
+ * Largest and most up-to-date lyrics database.
+ */
+async function fromGenius(query) {
+  const searches = await GeniusClient.songs.search(query);
+  if (!searches || searches.length === 0) return null;
+  const song   = searches[0];
+  const lyrics = await song.lyrics();
+  if (!lyrics || lyrics.trim().length < 20) return null;
+  return {
+    source:     'Genius',
+    trackName:  song.title  || query,
+    artistName: song.artist?.name || '',
+    lyrics:     lyrics.trim(),
+  };
+}
+
 async function fromLrclib(query) {
   const res = await fetchWithRetry(
     `${LRCLIB_SEARCH}${encodeURIComponent(query)}`,
@@ -167,15 +188,34 @@ async function fromLyricsOvh(query) {
   };
 }
 
+/**
+ * Try every (source, query) combination in priority order and return the
+ * first hit.  Sources are tried round-robin across queries so we get the
+ * best source for the best query, not just the best source for the first
+ * query.
+ *
+ * Priority: Genius (newest DB) → lrclib → lyrics.ovh
+ * Queries:  [artistTitle, cleanTitle, originalUserQuery, ...]
+ */
 async function fetchLyrics(queries) {
-  // queries = [string, ...] tried in order across both sources
+  const sources = [
+    { name: 'Genius',     fn: fromGenius    },
+    { name: 'lrclib',     fn: fromLrclib    },
+    { name: 'lyrics.ovh', fn: fromLyricsOvh },
+  ];
+
+  // Try each query with each source, outer=query inner=source
+  // so the "best" query is tried on all sources before moving on.
   for (const q of queries) {
-    for (const fn of [fromLrclib, fromLyricsOvh]) {
+    for (const { name, fn } of sources) {
       try {
         const r = await fn(q);
-        if (r) return r;
+        if (r) {
+          console.log(`[karaoke] lyrics found via ${name} for query: "${q}"`);
+          return r;
+        }
       } catch (e) {
-        console.warn(`[karaoke] lyrics fallback: ${e.message}`);
+        console.warn(`[karaoke] ${name} failed (q="${q}"): ${e.message}`);
       }
     }
   }
@@ -301,7 +341,7 @@ module.exports = {
         '  <code>/karaoke Bohemian Rhapsody</code>\n' +
         '  <code>/karaoke Queen - Bohemian Rhapsody</code>\n' +
         '  <code>/karaoke shape of you ed sheeran</code>\n\n' +
-        '📚 Lyrics: lrclib.net → lyrics.ovh (open source, no API key)\n' +
+        '📚 Lyrics: Genius → lrclib.net → lyrics.ovh (open source, no key)\n' +
         '🎵 Audio: YouTube karaoke search via yt-dlp'
       );
     }
@@ -335,10 +375,20 @@ module.exports = {
     const { cleanTitle, artist } = parseYtdlTitle(ytTitle);
     const titleShort_ = shortTitle(ytTitle);
 
-    // Build lyrics query list: cleaned ytdl title first, then original user query
-    const lyricsQueries = artist
-      ? [`${artist} ${cleanTitle}`, cleanTitle, userQuery]
-      : [cleanTitle, userQuery];
+    // Build lyrics query list — most-specific to least-specific.
+    // Genius/lrclib are tried on each before moving to the next query.
+    const lyricsQueries = [...new Set([
+      // 1. Artist + clean title (best signal)
+      ...(artist ? [`${artist} ${cleanTitle}`] : []),
+      // 2. Clean title alone
+      cleanTitle,
+      // 3. Raw ytdl title (still has context clues even with noise)
+      ytTitle,
+      // 4. Original user query (what they actually typed)
+      userQuery,
+      // 5. Artist alone + clean title with different separators, if artist found
+      ...(artist ? [`${artist} - ${cleanTitle}`] : []),
+    ].filter(Boolean))];
 
     // ── Step 2: download MP3 and search lyrics IN PARALLEL ──────────────────
     await ctx.editText(

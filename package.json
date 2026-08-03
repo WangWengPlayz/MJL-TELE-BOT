@@ -5,6 +5,7 @@
   "dependencies": {
     "dotenv": "^17.4.2",
     "flow-bin": "^0.325.0",
+    "genius-lyrics": "^4.4.7",
     "node-fetch": "^2.7.0"
   }
 }
