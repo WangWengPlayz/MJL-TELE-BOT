@@ -14,9 +14,13 @@ let running = true;
 let backoff = 1000;
 const commands = new Map();
 const events   = [];
-let commandsLoaded = false;
-let eventsLoaded   = false;
-let config = null;
+let commandsLoaded  = false;
+let eventsLoaded    = false;
+let config          = null;
+
+// ---- Runtime state (shared with commands via ctx) ----
+const cooldowns     = new Map();  // userId → Map<cmdName, lastUsedTimestamp>
+let maintenanceMode = false;
 
 // ---- Load config ----
 function loadConfig() {
@@ -355,6 +359,17 @@ function getUserProfilePhotos(token, userId, extra = {}) {
   return apiCall(token, 'getUserProfilePhotos', { user_id: userId, ...extra });
 }
 
+// ---- Helpers ----
+function isAdminUser(userId) {
+  return !!(config && config.adminId && Number(userId) === Number(config.adminId));
+}
+
+function parseCooldownMs(handler) {
+  const raw = handler.cooldown;
+  if (raw === 0 || raw === null) return 0;
+  return ((typeof raw === 'number' ? raw : 5) * 1000);
+}
+
 // ---- Update handling ----
 async function handleMessage(token, msg) {
   const chatId = msg.chat.id;
@@ -398,11 +413,36 @@ async function handleMessage(token, msg) {
     ).catch(() => {});
   }
 
+  const callerId = msg.from?.id;
+  const callerIsAdmin = isAdminUser(callerId);
+
   // Permission check
-  if (handler.permission === 2) {
-    const callerId = msg.from?.id;
-    if (!config.adminId || Number(callerId) !== Number(config.adminId)) {
-      return ctx.replyWithHTML('🔒 <b>Admin only.</b> You don\'t have permission to use this command.').catch(() => {});
+  if (handler.permission === 2 && !callerIsAdmin) {
+    return ctx.replyWithHTML('🔒 <b>Admin only.</b> You don\'t have permission to use this command.').catch(() => {});
+  }
+
+  // Maintenance mode — block non-admins
+  if (maintenanceMode && !callerIsAdmin) {
+    return ctx.replyWithHTML(
+      '🔧 <b>Maintenance Mode</b>\n\nThe bot is temporarily offline for maintenance.\nPlease try again later.'
+    ).catch(() => {});
+  }
+
+  // Cooldown check — admins bypass entirely
+  if (callerId && !callerIsAdmin) {
+    const cooldownMs = parseCooldownMs(handler);
+    if (cooldownMs > 0) {
+      if (!cooldowns.has(callerId)) cooldowns.set(callerId, new Map());
+      const userMap  = cooldowns.get(callerId);
+      const lastUsed = userMap.get(handler.name) || 0;
+      const remaining = cooldownMs - (Date.now() - lastUsed);
+      if (remaining > 0) {
+        const secs = (remaining / 1000).toFixed(1);
+        return ctx.replyWithHTML(
+          `⏱ <b>Cooldown</b>\n\nWait <code>${secs}s</code> before using <code>/${handler.name}</code> again.`
+        ).catch(() => {});
+      }
+      userMap.set(handler.name, Date.now());
     }
   }
 
@@ -440,6 +480,11 @@ function buildCtx(token, chatId) {
     chatId,
     commands,
     config,
+
+    // ---- Bot state ----
+    isAdminUser,
+    getMaintenance: ()  => maintenanceMode,
+    setMaintenance: (v) => { maintenanceMode = !!v; },
 
     // ---- Send ----
     reply:             (text, extra)              => sendMessage(token, chatId, text, extra),
