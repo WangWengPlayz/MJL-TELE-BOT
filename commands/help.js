@@ -154,11 +154,21 @@ async function execute(ctx) {
       : '';
     const permLabel = cmd.permission === 2 ? '\n🛡️ <b>Permission:</b> Admin only' : '\n👥 <b>Permission:</b> Members';
 
+    // Cooldown display — mirrors parseCooldownMs() logic from bot.js
+    const rawCd = cmd.cooldown;
+    let cooldownLabel;
+    if (rawCd === 0 || rawCd === null) {
+      cooldownLabel = '\n⏱ <b>Cooldown:</b> None';
+    } else {
+      const secs = typeof rawCd === 'number' ? rawCd : 5;
+      cooldownLabel = `\n⏱ <b>Cooldown:</b> ${secs}s per user`;
+    }
+
     return ctx.replyWithHTML(
       `📖 <b>/${escapeHtml(cmd.name)}</b>  <code>v${escapeHtml(cmd.version)}</code>\n\n` +
       `📝 ${escapeHtml(cmd.description)}\n\n` +
       `<b>Usage:</b> <code>${escapeHtml(cmd.usage || `/${cmd.name}`)}</code>` +
-      aliases + permLabel
+      aliases + permLabel + cooldownLabel
     );
   }
 
